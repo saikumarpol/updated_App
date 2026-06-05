@@ -16,7 +16,6 @@ import Svg, { Path, Circle, Line } from "react-native-svg";
 import * as Speech from "expo-speech";
 
 import { useRouter, useLocalSearchParams } from "expo-router";
-import { Camera as VisionCamera } from "react-native-vision-camera";
 
 // ─────────────────────────────────────────────────────────────────
 //  MODEL CONFIG
@@ -64,6 +63,25 @@ interface QualityState {
   cct:         number;
   tempStatus:  TempStatus;
 }
+
+// ─────────────────────────────────────────────────────────────────
+//  BBOX STATE — plain JS ref, written from worklet via runOnJS,
+//  read in handleCapture AFTER takePhoto resolves (no race).
+// ─────────────────────────────────────────────────────────────────
+interface BBoxState {
+  valid: boolean;
+  // normalized center-x, center-y, width, height in ORIGINAL FRAME space
+  cx: number;
+  cy: number;
+  w:  number;
+  h:  number;
+  frameW: number;
+  frameH: number;
+}
+
+const EMPTY_BBOX: BBoxState = {
+  valid: false, cx: 0, cy: 0, w: 0, h: 0, frameW: 0, frameH: 0,
+};
 
 // ─────────────────────────────────────────────────────────────────
 //  ICONS
@@ -164,12 +182,105 @@ function getProblemKey(
 }
 
 // ─────────────────────────────────────────────────────────────────
+//  UNCROP HELPER
+//  The resize plugin crops the frame to a centred square before
+//  passing it to the model.  This function maps a box expressed in
+//  model-normalised space back to original-frame-normalised space.
+// ─────────────────────────────────────────────────────────────────
+function uncropBox(
+  mx1: number, my1: number, mx2: number, my2: number,
+  frameW: number, frameH: number,
+) {
+  "worklet";
+  const minDim    = frameW < frameH ? frameW : frameH;
+  const cropXn    = (frameW - minDim) / 2 / frameW;
+  const cropYn    = (frameH - minDim) / 2 / frameH;
+  const cropScaleW = minDim / frameW;
+  const cropScaleH = minDim / frameH;
+  return {
+    x1: cropXn + mx1 * cropScaleW,
+    y1: cropYn + my1 * cropScaleH,
+    x2: cropXn + mx2 * cropScaleW,
+    y2: cropYn + my2 * cropScaleH,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  CROP UTILITY  (JS side, runs after takePhoto)
+//  Receives the BBoxState that was latched just before capture.
+//  bbox.cx/cy/w/h are in visual-frame-normalised space (0-1).
+//  Image.getSize returns the actual pixel dimensions of the saved
+//  photo which is already in visual orientation — so we multiply
+//  directly without any axis swap.
+// ─────────────────────────────────────────────────────────────────
+const CROP_PADDING = 0.15; // fractional padding added around bbox on each side
+
+async function cropByBBox(uri: string, bbox: BBoxState): Promise<string> {
+  if (!bbox.valid) {
+    console.log("[CROP] bbox not valid — returning full image");
+    return uri;
+  }
+  try {
+    const { width: imgW, height: imgH } = await new Promise<{ width: number; height: number }>(
+      (resolve, reject) =>
+        Image.getSize(uri, (w, h) => resolve({ width: w, height: h }), reject)
+    );
+
+    // bbox w/h are normalised to the visual frame.
+    // Add padding so the eye region isn't clipped too tightly.
+    const padX = bbox.w * CROP_PADDING;
+    const padY = bbox.h * CROP_PADDING;
+
+    const x1n = Math.max(0, bbox.cx - bbox.w / 2 - padX);
+    const y1n = Math.max(0, bbox.cy - bbox.h / 2 - padY);
+    const x2n = Math.min(1, bbox.cx + bbox.w / 2 + padX);
+    const y2n = Math.min(1, bbox.cy + bbox.h / 2 + padY);
+
+    const originX = Math.round(x1n * imgW);
+    const originY = Math.round(y1n * imgH);
+    const cropW   = Math.round((x2n - x1n) * imgW);
+    const cropH   = Math.round((y2n - y1n) * imgH);
+
+    if (cropW < 10 || cropH < 10) {
+      console.warn("[CROP] computed crop too small, returning full image", { cropW, cropH });
+      return uri;
+    }
+
+    // Clamp to image bounds (safety)
+    const safeOriginX = Math.max(0, Math.min(imgW - 1, originX));
+    const safeOriginY = Math.max(0, Math.min(imgH - 1, originY));
+    const safeW       = Math.min(imgW - safeOriginX, cropW);
+    const safeH       = Math.min(imgH - safeOriginY, cropH);
+
+    console.log("[CROP] applying crop", {
+      safeOriginX, safeOriginY, safeW, safeH, imgW, imgH,
+      bboxCx: bbox.cx.toFixed(3), bboxCy: bbox.cy.toFixed(3),
+      bboxW: bbox.w.toFixed(3), bboxH: bbox.h.toFixed(3),
+    });
+
+    const result = await ImageManipulator.manipulateAsync(
+      uri,
+      [{ crop: {
+        originX: safeOriginX,
+        originY: safeOriginY,
+        width:   safeW,
+        height:  safeH,
+      }}],
+      { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
+    );
+    return result.uri ?? uri;
+  } catch (err) {
+    console.warn("[CROP] error, returning full image:", err);
+    return uri;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 //  COMPONENT
 // ─────────────────────────────────────────────────────────────────
 export default function EyeCaptureScreen() {
   const router = useRouter();
 
-  // Params from form screen
   const params = useLocalSearchParams<{
     name?: string;
     parentName?: string;
@@ -200,9 +311,15 @@ export default function EyeCaptureScreen() {
     cct: 5500, tempStatus: "good",
   });
 
-  // Auto-capture timer ref — cleared whenever conditions stop being "all good"
-  const autoCaptureTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Track whether auto-capture countdown is running (for UI feedback)
+  // ── BBox ref ────────────────────────────────────────────────────
+  // Written from the frame-processor via runOnJS every frame that has
+  // a valid detection.  Read in handleCapture AFTER takePhoto resolves
+  // so there is zero race condition — the photo is already on disk by
+  // the time we look at this value.
+  const latestBBoxRef = useRef<BBoxState>(EMPTY_BBOX);
+
+  // Auto-capture timer
+  const autoCaptureTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [autoCapturePending, setAutoCapturePending] = useState(false);
 
   const lastSpokenKey  = useRef<string | null>(null);
@@ -215,22 +332,17 @@ export default function EyeCaptureScreen() {
 
   const { model, state } = useTensorflowModel(
     require("../assets/model/conjuctiva.tflite")
-      // require("../assets/model/best_float32_conjunctiva.tflite")
+    // require("../assets/model/best_float32_conjunctiva.tflite")
   );
   const { resize } = useResizePlugin();
 
-  // Shared values
+  // Worklet-side shared values (used ONLY inside the frame processor)
   const smoothedScore  = useSharedValue(0);
   const stableOnCount  = useSharedValue(0);
   const stableOffCount = useSharedValue(0);
   const confirmedState = useSharedValue(0);
   const isFrontCam     = useSharedValue(0);
   const frameCounter   = useSharedValue(0);
-  const bboxX          = useSharedValue(0);
-  const bboxY          = useSharedValue(0);
-  const bboxW          = useSharedValue(0);
-  const bboxH          = useSharedValue(0);
-  const bboxValid      = useSharedValue(0);
 
   useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission]);
   useEffect(() => () => { Speech.stop(); }, []);
@@ -242,6 +354,7 @@ export default function EyeCaptureScreen() {
     stableOffCount.value = 0;
     confirmedState.value = 0;
     frameCounter.value   = 0;
+    latestBBoxRef.current = EMPTY_BBOX;
     setIsDetected(false);
     setCamReady(false);
     setDebugInfo(`Switching to ${facing}...`);
@@ -250,9 +363,19 @@ export default function EyeCaptureScreen() {
     return () => clearTimeout(t);
   }, [facing]);
 
+  // runOnJS bridges
   const setIsDetectedJS = Worklets.createRunOnJS(setIsDetected);
   const setDebugInfoJS  = Worklets.createRunOnJS(setDebugInfo);
   const setQualityJS    = Worklets.createRunOnJS(setQuality);
+
+  // This bridge writes the latest bbox into the JS ref from the worklet.
+  // It is called with plain numbers so it is safe to cross the bridge.
+  const updateBBoxRef = Worklets.createRunOnJS(
+    (valid: boolean, cx: number, cy: number, w: number, h: number,
+     frameW: number, frameH: number) => {
+      latestBBoxRef.current = { valid, cx, cy, w, h, frameW, frameH };
+    }
+  );
 
   const speakNow = useCallback((key: string, l: Lang = lang) => {
     const entry = VOICE[key]?.[l];
@@ -266,36 +389,7 @@ export default function EyeCaptureScreen() {
     });
   }, [lang]);
 
-  const getImageSize = (uri: string) => new Promise<{ width: number; height: number }>((resolve, reject) => {
-    Image.getSize(uri, (width, height) => resolve({ width, height }), reject);
-  });
-
-  const cropUriByBoundingBox = async (uri: string) => {
-    if (!bboxValid.value) return uri;
-    try {
-      const { width, height } = await getImageSize(uri);
-      const centerX = bboxX.value;
-      const centerY = bboxY.value;
-      const boxW = bboxW.value;
-      const boxH = bboxH.value;
-      const originX = Math.max(0, Math.min(1, centerX - boxW / 2));
-      const originY = Math.max(0, Math.min(1, centerY - boxH / 2));
-      const cropWidth = Math.max(1, Math.min(width, Math.round(boxW * width)));
-      const cropHeight = Math.max(1, Math.min(height, Math.round(boxH * height)));
-      const cropX = Math.max(0, Math.min(width - cropWidth, Math.round(originX * width)));
-      const cropY = Math.max(0, Math.min(height - cropHeight, Math.round(originY * height)));
-      const crop = { originX: cropX, originY: cropY, width: cropWidth, height: cropHeight };
-      const result = await ImageManipulator.manipulateAsync(uri, [{ crop }], {
-        compress: 0.9,
-        format: ImageManipulator.SaveFormat.JPEG,
-      });
-      return result.uri ?? uri;
-    } catch (err: any) {
-      console.warn("[CROP] failed", err);
-      return uri;
-    }
-  };
-
+  // ── allGood gate ───────────────────────────────────────────────
   const allGood =
     isDetected &&
     quality.blurStatus  === "good" &&
@@ -316,26 +410,20 @@ export default function EyeCaptureScreen() {
   }, [problemKey, lang, speakNow]);
 
   // ── Auto-capture logic ─────────────────────────────────────────
-  // When allGood transitions true → start 500 ms timer → fire capture.
-  // If allGood goes false before the timer fires → cancel.
   useEffect(() => {
     if (allGood && !capturing) {
-      // Start countdown
       setAutoCapturePending(true);
       autoCaptureTimer.current = setTimeout(() => {
         setAutoCapturePending(false);
-        // Re-check allGood inside timeout (capturing ref avoids stale closure)
         handleCapture();
       }, AUTO_CAPTURE_DELAY);
     } else {
-      // Cancel any pending countdown
       if (autoCaptureTimer.current) {
         clearTimeout(autoCaptureTimer.current);
         autoCaptureTimer.current = null;
       }
       setAutoCapturePending(false);
     }
-
     return () => {
       if (autoCaptureTimer.current) {
         clearTimeout(autoCaptureTimer.current);
@@ -346,12 +434,18 @@ export default function EyeCaptureScreen() {
   }, [allGood, capturing]);
 
   // ── Capture handler ────────────────────────────────────────────
+  // Strategy:
+  //   1. takePhoto()  ← camera shutter
+  //   2. Read latestBBoxRef.current  ← no race; photo is on disk, frame
+  //      processor keeps running and has had ample time to write good data
+  //   3. cropByBBox() with the bbox that was current at step 2
   const handleCapture = useCallback(async () => {
     if (capturing || !cameraRef.current) return;
     setCapturing(true);
     Speech.stop();
 
     try {
+      // Step 1 — take the photo
       const photo = await cameraRef.current.takePhoto({
         qualityPrioritization: "balanced",
         flash: "off",
@@ -362,9 +456,15 @@ export default function EyeCaptureScreen() {
         ? `file://${photo.path}`
         : photo.path;
 
-      const croppedUri = await cropUriByBoundingBox(uri);
+      // Step 2 — read the LATEST bbox the frame processor wrote.
+      // takePhoto is async (can be 200-600 ms) so by now the frame
+      // processor has had many more frames to refine the detection.
+      const bbox = latestBBoxRef.current;
+      console.log("[CAPTURE] bbox at photo-ready time:", JSON.stringify(bbox));
 
-      // Return to form screen with the cropped eye image + all existing params
+      // Step 3 — crop
+      const croppedUri = await cropByBBox(uri, bbox);
+
       router.replace({
         pathname: "/",
         params: {
@@ -382,7 +482,7 @@ export default function EyeCaptureScreen() {
       console.error("[CAPTURE] error:", err);
       setCapturing(false);
     }
-  }, [capturing, cropUriByBoundingBox, eyeSide, params, router]);
+  }, [capturing, eyeSide, params, router]);
 
   // ── Frame processor ────────────────────────────────────────────
   const frameProcessor = useFrameProcessor((frame) => {
@@ -413,7 +513,7 @@ export default function EyeCaptureScreen() {
       return;
     }
 
-    // Quality checks
+    // ── Quality checks ──────────────────────────────────────────
     const qd = resized as Float32Array;
     const qW = MODEL_INPUT_SIZE;
     const qH = MODEL_INPUT_SIZE;
@@ -491,6 +591,7 @@ export default function EyeCaptureScreen() {
 
     setQualityJS({ blurScore, blurStatus, brightness, lightStatus, cct, tempStatus });
 
+    // ── Model inference ─────────────────────────────────────────
     let outputs: any;
     try {
       outputs = model.runSync([resized]);
@@ -501,41 +602,88 @@ export default function EyeCaptureScreen() {
     if (!outputs || outputs.length === 0) return;
 
     const raw = outputs[0] as Float32Array;
-    let bestScore = 0, bestRawScore = 0, bestRawArea = 0;
+
+    // Frame dimensions (needed for uncrop).
+    // IMPORTANT: frame.width/height are RAW sensor dimensions (e.g. 1920×1080
+    // landscape).  The resize plugin rotates the frame by `rotation` BEFORE
+    // cropping to a square, so the effective visual frame after rotation is
+    // 1080×1920 (portrait).  We must swap W↔H for 90°/270° rotations so that
+    // uncropBox works in the rotated (visual) coordinate space, which matches
+    // the normalised coords the model outputs.
+    const rawFw = frame.width;
+    const rawFh = frame.height;
+    const is90or270 = rotation === "90deg" || rotation === "270deg";
+    const fw = is90or270 ? rawFh : rawFw;   // visual width  after rotation
+    const fh = is90or270 ? rawFw : rawFh;   // visual height after rotation
+
     let bestBoxScore = 0;
-    let bestBoxX = 0, bestBoxY = 0, bestBoxW = 0, bestBoxH = 0;
+    let bestMx1 = 0, bestMy1 = 0, bestMx2 = 0, bestMy2 = 0;
+    let bestScore = 0;
+
     for (let i = 0; i < NUM_DETECTIONS; i++) {
       const base  = i * VALS_PER_BOX;
       const score = raw[base + 4];
       if (score < 0.05) continue;
-      const x = raw[base + 0];
-      const y = raw[base + 1];
-      const w = raw[base + 2], h = raw[base + 3];
-      if (w <= 0 || h <= 0 || w > 1.5 || h > 1.5) continue;
-      const area = w * h;
-      if (score > bestRawScore) { bestRawScore = score; bestRawArea = area; }
+
+      // Model output: cx, cy, w, h in model-normalised space
+      const mcx = raw[base + 0];
+      const mcy = raw[base + 1];
+      const mw  = raw[base + 2];
+      const mh  = raw[base + 3];
+      if (mw <= 0 || mh <= 0 || mw > 1.5 || mh > 1.5) continue;
+
+      const area = mw * mh;
       if (area < MIN_BOX_AREA || area > MAX_BOX_AREA) continue;
+
       if (score > bestBoxScore) {
         bestBoxScore = score;
-        bestBoxX = x;
-        bestBoxY = y;
-        bestBoxW = w;
-        bestBoxH = h;
+        // Convert centre+wh → corners for uncrop
+        bestMx1 = mcx - mw / 2;
+        bestMy1 = mcy - mh / 2;
+        bestMx2 = mcx + mw / 2;
+        bestMy2 = mcy + mh / 2;
       }
       if (score > bestScore) bestScore = score;
     }
 
-    if (confirmedState.value === 1 && bestBoxScore > 0) {
-      const normalizedX = isFront ? 1 - bestBoxX : bestBoxX;
-      bboxX.value = Math.max(0, Math.min(1, normalizedX));
-      bboxY.value = Math.max(0, Math.min(1, bestBoxY));
-      bboxW.value = Math.max(0, Math.min(1, bestBoxW));
-      bboxH.value = Math.max(0, Math.min(1, bestBoxH));
-      bboxValid.value = 1;
+    // ── Update bbox ref via runOnJS ──────────────────────────────
+    // Always update (even when confirmedState is 0) so that by the
+    // time takePhoto resolves we have the freshest possible data.
+    if (bestBoxScore > 0) {
+      // Map model-space corners → original frame normalised coords
+      const oc = uncropBox(bestMx1, bestMy1, bestMx2, bestMy2, fw, fh);
+
+      // Back to centre + wh
+      let ocx = (oc.x1 + oc.x2) / 2;
+      const ocy = (oc.y1 + oc.y2) / 2;
+      const ow  = oc.x2 - oc.x1;
+      const oh  = oc.y2 - oc.y1;
+
+      // Mirror X for front camera (resize plugin already mirrors the
+      // pixel data, but the coordinate system needs explicit flip)
+      if (isFront) ocx = 1 - ocx;
+
+      const cx = ocx < 0 ? 0 : ocx > 1 ? 1 : ocx;
+      const cy = ocy < 0 ? 0 : ocy > 1 ? 1 : ocy;
+      const cw = ow  < 0 ? 0 : ow  > 1 ? 1 : ow;
+      const ch = oh  < 0 ? 0 : oh  > 1 ? 1 : oh;
+
+      // Write to JS ref — safe from any thread via Worklets bridge
+      updateBBoxRef(true, cx, cy, cw, ch, fw, fh);
+
+      setDebugInfoJS(
+        `[${tag}] score:${bestBoxScore.toFixed(2)} cx:${cx.toFixed(3)} cy:${cy.toFixed(3)} ` +
+        `w:${cw.toFixed(3)} h:${ch.toFixed(3)} frame:${fw}×${fh}`
+      );
     } else {
-      bboxValid.value = 0;
+      // No detection this frame — do NOT clear the ref so handleCapture
+      // can still use the last known good position.
+      if (f % 15 === 0) {
+        setDebugInfoJS(`[${tag}] no detection (smooth:${smoothedScore.value.toFixed(2)})`);
+      }
     }
 
+    // ── Stable detection state machine ───────────────────────────
     smoothedScore.value = SMOOTHING * bestScore + (1 - SMOOTHING) * smoothedScore.value;
     const isGoodFrame   = smoothedScore.value >= CONF_THRESHOLD;
     if (isGoodFrame) { stableOnCount.value++;  stableOffCount.value = 0; }
@@ -547,10 +695,6 @@ export default function EyeCaptureScreen() {
     confirmedState.value = newState;
 
     setIsDetectedJS(newState === 1);
-    setDebugInfoJS(
-      `[${tag}] score:${bestScore.toFixed(2)} smooth:${smoothedScore.value.toFixed(2)} ` +
-      `on:${stableOnCount.value} off:${stableOffCount.value}`
-    );
   }, [model, camReady]);
 
   // ── Guards ─────────────────────────────────────────────────────
@@ -579,7 +723,6 @@ export default function EyeCaptureScreen() {
   const guideColor = allGood ? "#00ff66" : "#4c9fff";
   const sideLabel  = eyeSide === "left" ? "LEFT EYE" : "RIGHT EYE";
 
-  // ── Capture button label ───────────────────────────────────────
   let captureBtnLabel = "Waiting…";
   if (capturing)           captureBtnLabel = "Capturing…";
   else if (autoCapturePending) captureBtnLabel = "📸 Auto…";
@@ -615,7 +758,6 @@ export default function EyeCaptureScreen() {
 
       {/* TOP PANEL */}
       <View style={s.topPanel}>
-        {/* Back + Side label + Lang + Flip */}
         <View style={s.controlRow}>
           <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
             <Text style={s.backBtnText}>← Back</Text>
@@ -704,10 +846,10 @@ export default function EyeCaptureScreen() {
         <Text style={s.debugText}>{debugInfo}</Text>
         <Text style={s.debugText}>
           Blur:{quality.blurScore.toFixed(0)} | Bright:{quality.brightness.toFixed(0)} |{" "}
-          {quality.cct.toFixed(0)}K | cam:{facing} | ready:{camReady ? "✅" : "⏳"}
+          {quality.cct.toFixed(0)}K | cam:{facing} | ready:{camReady ? "✅" : "⏳"} |{" "}
+          bbox:{latestBBoxRef.current.valid ? "✅" : "❌"}
         </Text>
 
-        {/* Auto-capture countdown bar */}
         {autoCapturePending && (
           <View style={s.autoBarTrack}>
             <View style={s.autoBarFill} />
@@ -828,7 +970,6 @@ const s = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.65)",
   },
 
-  // Auto-capture countdown bar
   autoBarTrack: {
     width: 200, height: 4, borderRadius: 2,
     backgroundColor: "rgba(255,255,255,0.15)", overflow: "hidden",
@@ -836,8 +977,6 @@ const s = StyleSheet.create({
   autoBarFill: {
     height: "100%", borderRadius: 2,
     backgroundColor: "#00ff66",
-    // CSS animation not available in RN — the bar is shown as a static "ready" indicator.
-    // For a true animated fill you can swap this for an Animated.View with useEffect.
     width: "100%",
   },
 
