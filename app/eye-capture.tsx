@@ -619,10 +619,15 @@ export default function EyeCaptureScreen() {
     let bestBoxScore = 0;
     let bestMx1 = 0, bestMy1 = 0, bestMx2 = 0, bestMy2 = 0;
     let bestScore = 0;
-
+     
+    
     for (let i = 0; i < NUM_DETECTIONS; i++) {
       const base  = i * VALS_PER_BOX;
       const score = raw[base + 4];
+      if(bestScore <= score){
+        bestScore = score;
+      }
+
       if (score < 0.05) continue;
 
       // Model output: cx, cy, w, h in model-normalised space
@@ -738,7 +743,7 @@ export default function EyeCaptureScreen() {
         device={device}
         isActive={true}
         frameProcessor={frameProcessor}
-        pixelFormat="rgb"
+        // pixelFormat="rgb"
         photo={true}
         onInitialized={() => { console.log(`[CAM] ${facing} initialized ✅`); setCamReady(true); }}
         onError={(e) => {
