@@ -1,7 +1,6 @@
-// app/eye-capture.tsx
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
-  Image, StyleSheet, Text, View, TouchableOpacity,
+  StyleSheet, Text, View, TouchableOpacity,
   ActivityIndicator, Platform,
 } from "react-native";
 import * as ImageManipulator from "expo-image-manipulator";
@@ -20,19 +19,36 @@ import { useRouter, useLocalSearchParams } from "expo-router";
 // ─────────────────────────────────────────────────────────────────
 //  MODEL CONFIG
 // ─────────────────────────────────────────────────────────────────
-const MODEL_INPUT_SIZE  = 320;
-const NUM_DETECTIONS    = 300;
-const VALS_PER_BOX      = 6;
-const CONF_THRESHOLD    = 0.25;
-const STABLE_FRAMES_ON  = 4;
-const STABLE_FRAMES_OFF = 6;
-const SMOOTHING         = 0.35;
-const MAX_BOX_AREA      = 0.85;
-const MIN_BOX_AREA      = 0.05;
+const MODEL_INPUT_SIZE = 320;
+const GUIDE_BOX_SIZE   = 512;
+const NUM_DETECTIONS   = 300;
+const VALS_PER_BOX     = 6;
+const CONF_THRESHOLD   = 0.25;
 
-const BACK_ROTATION  = "90deg" as const;
-const FRONT_ROTATION = "90deg" as const;
-const FRONT_MIRROR   = true;
+const BBOX_MARGIN         = 20;
+const BBOX_MIN_AREA_RATIO = 0.03;
+const BBOX_MAX_AREA_RATIO = 0.18;
+const BBOX_MIN_AREA       = BBOX_MIN_AREA_RATIO * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+const BBOX_MAX_AREA       = BBOX_MAX_AREA_RATIO * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+const BBOX_DEBUG_LOG      = true;
+const BEST_OF_FRAMES      = 4;
+
+// ─────────────────────────────────────────────────────────────────
+//  ROTATION / MIRROR CONFIG
+// ─────────────────────────────────────────────────────────────────
+type RotationDeg = "0deg" | "90deg" | "180deg" | "270deg";
+
+const ROTATION_CONFIG: Record<"ios" | "android", { front: RotationDeg; back: RotationDeg }> = {
+  ios:     { front: "90deg",  back: "90deg"  },
+  android: { front: "270deg", back: "90deg"  },
+};
+
+const MIRROR_CONFIG: Record<"ios" | "android", { front: boolean; back: boolean }> = {
+  ios:     { front: true,  back: false },
+  android: { front: false, back: false },
+};
+
+const PLATFORM_KEY: "ios" | "android" = Platform.OS === "android" ? "android" : "ios";
 
 // ─────────────────────────────────────────────────────────────────
 //  QUALITY THRESHOLDS
@@ -43,9 +59,6 @@ const BRIGHTNESS_HIGH    = 205;
 const CCT_WARM_THRESHOLD = 3900;
 const CCT_WARM_BIAS      = 1.0;
 const Q_STEP             = 4;
-
-// Auto-capture delay in ms after all checks go green
-const AUTO_CAPTURE_DELAY = 700;
 
 // ─────────────────────────────────────────────────────────────────
 //  TYPES
@@ -64,24 +77,92 @@ interface QualityState {
   tempStatus:  TempStatus;
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  BBOX STATE — plain JS ref, written from worklet via runOnJS,
-//  read in handleCapture AFTER takePhoto resolves (no race).
-// ─────────────────────────────────────────────────────────────────
-interface BBoxState {
+interface DetectedBox {
+  x1: number; y1: number; x2: number; y2: number;
+  score: number;
+  type: "full" | "partial";
   valid: boolean;
-  // normalized center-x, center-y, width, height in ORIGINAL FRAME space
-  cx: number;
-  cy: number;
-  w:  number;
-  h:  number;
-  frameW: number;
-  frameH: number;
+  areaRatio: number;
 }
 
-const EMPTY_BBOX: BBoxState = {
-  valid: false, cx: 0, cy: 0, w: 0, h: 0, frameW: 0, frameH: 0,
+// ─────────────────────────────────────────────────────────────────
+//  FRAME DIMS REF
+// ─────────────────────────────────────────────────────────────────
+interface FrameDims {
+  rawW: number;
+  rawH: number;
+  rotation: RotationDeg;
+  mirror: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  PERF TRACKER
+// ─────────────────────────────────────────────────────────────────
+const perfHistory = {
+  resize:  [] as number[],
+  quality: [] as number[],
+  infer:   [] as number[],
+  detect:  [] as number[],
+  total:   [] as number[],
+  maxLen: 60,
 };
+
+function trackPerf(key: keyof Omit<typeof perfHistory, "maxLen">, ms: number) {
+  const arr = perfHistory[key];
+  arr.push(ms);
+  if (arr.length > perfHistory.maxLen) arr.shift();
+}
+
+function avgPerf(key: keyof Omit<typeof perfHistory, "maxLen">) {
+  const arr = perfHistory[key];
+  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+}
+
+function p95Perf(key: keyof Omit<typeof perfHistory, "maxLen">) {
+  const arr = [...perfHistory[key]].sort((a, b) => a - b);
+  if (!arr.length) return 0;
+  return arr[Math.floor(arr.length * 0.95)] ?? arr[arr.length - 1];
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  STRUCTURED LOGGER
+// ─────────────────────────────────────────────────────────────────
+type LogScope =
+  | "app-init"
+  | "camera-init"
+  | "camera-switch"
+  | "camera-initialized"
+  | "camera-error"
+  | "camera-flip"
+  | "model-state"
+  | "permission"
+  | "frame-perf"
+  | "frame-perf-summary"
+  | "resize"
+  | "resize-diagnostic"
+  | "quality-metrics"
+  | "quality-change"
+  | "bbox"
+  | "detection-summary"
+  | "eye-confirmed"
+  | "voice-guidance"
+  | "auto-capture-trigger"
+  | "capture-start"
+  | "capture-photo-done"
+  | "capture-crop-start"
+  | "crop-512-input"
+  | "crop-512-clamped"
+  | "crop-512-done"
+  | "crop-512-error"
+  | "capture-complete"
+  | "capture-error"
+  | "capture-aborted"
+  | "lang-change"
+  | "session-info";
+
+function clog(scope: LogScope, data: Record<string, unknown>) {
+  console.log(JSON.stringify({ ts: Date.now(), scope, ...data }));
+}
 
 // ─────────────────────────────────────────────────────────────────
 //  ICONS
@@ -161,116 +242,214 @@ const VOICE: Record<string, Record<Lang, { text: string; bcp47: string }>> = {
     te: { text: "పసుపు వెలుతురు నుండి దూరంగా ఉండండి. మంచి ఫలితం కోసం తెల్లటి వెలుతురు ఉపయోగించండి.", bcp47: "te-IN" },
   },
   allGood: {
-    en: { text: "Good! Tap Capture now.", bcp47: "en-IN" },
-    hi: { text: "बढ़िया! अब कैप्चर दबाएं।", bcp47: "hi-IN" },
-    te: { text: "బాగుంది! ఇప్పుడు క్యాప్చర్ నొక్కండి.", bcp47: "te-IN" },
+    en: { text: "Good! Capturing now.", bcp47: "en-IN" },
+    hi: { text: "बढ़िया! अभी कैप्चर हो रहा है।", bcp47: "hi-IN" },
+    te: { text: "బాగుంది! ఇప్పుడు క్యాప్చర్ అవుతోంది.", bcp47: "te-IN" },
   },
 };
 
 function getProblemKey(
-  detected: boolean,
+  eyeConfirmed: boolean,
   lightStatus: string,
   blurStatus: string,
   tempStatus: string,
 ): string {
-  if (!detected)              return "alignFace";
-  if (lightStatus === "low")  return "lowLight";
-  if (lightStatus === "high") return "highLight";
-  if (tempStatus  === "warm") return "warmLight";
+  if (!eyeConfirmed)            return "alignFace";
+  if (lightStatus === "low")    return "lowLight";
+  if (lightStatus === "high")   return "highLight";
+  if (tempStatus  === "warm")   return "warmLight";
   if (blurStatus  === "blurry") return "holdStill";
   return "allGood";
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  UNCROP HELPER
-//  The resize plugin crops the frame to a centred square before
-//  passing it to the model.  This function maps a box expressed in
-//  model-normalised space back to original-frame-normalised space.
+//  BBOX VALIDATION
 // ─────────────────────────────────────────────────────────────────
-function uncropBox(
-  mx1: number, my1: number, mx2: number, my2: number,
-  frameW: number, frameH: number,
+function validateBBox(
+  nx1: number, ny1: number, nx2: number, ny2: number,
+  imgW: number, imgH: number,
 ) {
   "worklet";
-  const minDim    = frameW < frameH ? frameW : frameH;
-  const cropXn    = (frameW - minDim) / 2 / frameW;
-  const cropYn    = (frameH - minDim) / 2 / frameH;
-  const cropScaleW = minDim / frameW;
-  const cropScaleH = minDim / frameH;
+
+  const x1 = Math.round(nx1 * imgW);
+  const y1 = Math.round(ny1 * imgH);
+  const x2 = Math.round(nx2 * imgW);
+  const y2 = Math.round(ny2 * imgH);
+
+  const touchesLeft   = x1 <= BBOX_MARGIN;
+  const touchesTop    = y1 <= BBOX_MARGIN;
+  const touchesRight  = x2 >= (imgW - BBOX_MARGIN);
+  const touchesBottom = y2 >= (imgH - BBOX_MARGIN);
+
+  const isPartial = touchesLeft || touchesTop || touchesRight || touchesBottom;
+
+  if (isPartial) {
+    return {
+      valid: 0 as const,
+      type: "partial" as const,
+      area: 0,
+      areaRatio: 0,
+      x1, y1, x2, y2,
+      reason: "touching border",
+    };
+  }
+
+  const width     = x2 - x1;
+  const height    = y2 - y1;
+  const area      = width * height;
+  const areaRatio = area / (imgW * imgH);
+  const areaOk    = area >= BBOX_MIN_AREA && area <= BBOX_MAX_AREA;
+
   return {
-    x1: cropXn + mx1 * cropScaleW,
-    y1: cropYn + my1 * cropScaleH,
-    x2: cropXn + mx2 * cropScaleW,
-    y2: cropYn + my2 * cropScaleH,
+    valid: (areaOk ? 1 : 0) as 0 | 1,
+    type: "full" as const,
+    area,
+    areaRatio,
+    x1, y1, x2, y2,
+    reason: areaOk ? "ok" : "area out of range",
   };
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  CROP UTILITY  (JS side, runs after takePhoto)
-//  Receives the BBoxState that was latched just before capture.
-//  bbox.cx/cy/w/h are in visual-frame-normalised space (0-1).
-//  Image.getSize returns the actual pixel dimensions of the saved
-//  photo which is already in visual orientation — so we multiply
-//  directly without any axis swap.
+//  CROP UTILITY — FIXED iOS + ANDROID
+//
+//  iOS:
+//    takePhoto() returns a photo already in LOGICAL orientation
+//    (EXIF applied by OS). Scale the center crop from logical
+//    frame coords → photo pixel coords directly.
+//
+//  Android:
+//    takePhoto() returns the photo in RAW SENSOR orientation
+//    (NOT rotated). However, for ANY rotation (0/90/180/270°),
+//    the guide box center-crop maps back to a CENTERED square
+//    in sensor space (rotation is a rigid transform preserving
+//    center and size). So we always crop the center of the photo
+//    at GUIDE_BOX_SIZE scaled to actual photo resolution.
 // ─────────────────────────────────────────────────────────────────
-const CROP_PADDING = 0.15; // fractional padding added around bbox on each side
+async function cropGuideBoxTo512(
+  uri: string,
+  dims: FrameDims,
+): Promise<string> {
+  const cropStart = Date.now();
+  const { rawW, rawH, rotation } = dims;
 
-async function cropByBBox(uri: string, bbox: BBoxState): Promise<string> {
-  if (!bbox.valid) {
-    console.log("[CROP] bbox not valid — returning full image");
-    return uri;
-  }
+  clog("capture-crop-start", { uri, rawW, rawH, rotation, platform: Platform.OS });
+
   try {
+    // Step 1: get saved photo pixel size
     const { width: imgW, height: imgH } = await new Promise<{ width: number; height: number }>(
       (resolve, reject) =>
-        Image.getSize(uri, (w, h) => resolve({ width: w, height: h }), reject)
+        require("react-native").Image.getSize(
+          uri,
+          (w: number, h: number) => resolve({ width: w, height: h }),
+          reject,
+        )
     );
 
-    // bbox w/h are normalised to the visual frame.
-    // Add padding so the eye region isn't clipped too tightly.
-    const padX = bbox.w * CROP_PADDING;
-    const padY = bbox.h * CROP_PADDING;
+    let originX: number;
+    let originY: number;
+    let cropW: number;
+    let cropH: number;
 
-    const x1n = Math.max(0, bbox.cx - bbox.w / 2 - padX);
-    const y1n = Math.max(0, bbox.cy - bbox.h / 2 - padY);
-    const x2n = Math.min(1, bbox.cx + bbox.w / 2 + padX);
-    const y2n = Math.min(1, bbox.cy + bbox.h / 2 + padY);
+    if (Platform.OS === "ios") {
+      // ── iOS path ───────────────────────────────────────────────
+      // Photo pixel dimensions match the logical (rotated) frame.
+      // Logical frame dims (what the model sees as upright):
+      const is90or270 = rotation === "90deg" || rotation === "270deg";
+      const logicalW  = is90or270 ? rawH : rawW;
+      const logicalH  = is90or270 ? rawW : rawH;
 
-    const originX = Math.round(x1n * imgW);
-    const originY = Math.round(y1n * imgH);
-    const cropW   = Math.round((x2n - x1n) * imgW);
-    const cropH   = Math.round((y2n - y1n) * imgH);
+      // Scale from logical frame → photo pixels
+      const scaleX = imgW / logicalW;
+      const scaleY = imgH / logicalH;
+      const half   = GUIDE_BOX_SIZE / 2;
 
-    if (cropW < 10 || cropH < 10) {
-      console.warn("[CROP] computed crop too small, returning full image", { cropW, cropH });
-      return uri;
+      originX = Math.round((logicalW / 2 - half) * scaleX);
+      originY = Math.round((logicalH / 2 - half) * scaleY);
+      cropW   = Math.round(GUIDE_BOX_SIZE * scaleX);
+      cropH   = Math.round(GUIDE_BOX_SIZE * scaleY);
+
+      clog("crop-512-input", {
+        platform: "ios",
+        rawW, rawH, rotation,
+        logicalW, logicalH,
+        imgW, imgH,
+        scaleX: +scaleX.toFixed(3),
+        scaleY: +scaleY.toFixed(3),
+        originX, originY, cropW, cropH,
+      });
+
+    } else {
+      // ── Android path ───────────────────────────────────────────
+      // Photo is in RAW SENSOR orientation (imgW ≈ rawW scale,
+      // imgH ≈ rawH scale — same aspect ratio, possibly higher res).
+      //
+      // Key insight: for ANY rotation (0/90/180/270°), the inverse
+      // rotation maps the logical center crop back to a CENTERED
+      // square in sensor space. Proof:
+      //   • The guide box is centered at the logical frame center (0.5, 0.5 normalized).
+      //   • Any rotation maps the sensor center → logical center.
+      //   • The inverse also maps logical center → sensor center.
+      //   • A square crop centered at logical center → square crop
+      //     centered at sensor center (rigid transform, size preserved).
+      //
+      // Therefore: always crop the CENTER of the photo (sensor space)
+      // at GUIDE_BOX_SIZE scaled to actual photo resolution.
+
+      const sensorScaleX = imgW / rawW;  // photo pixels per raw sensor pixel
+      const sensorScaleY = imgH / rawH;
+
+      cropW   = Math.round(GUIDE_BOX_SIZE * sensorScaleX);
+      cropH   = Math.round(GUIDE_BOX_SIZE * sensorScaleY);
+      originX = Math.round(imgW / 2 - cropW / 2);
+      originY = Math.round(imgH / 2 - cropH / 2);
+
+      clog("crop-512-input", {
+        platform: "android",
+        rawW, rawH, rotation,
+        imgW, imgH,
+        sensorScaleX: +sensorScaleX.toFixed(3),
+        sensorScaleY: +sensorScaleY.toFixed(3),
+        originX, originY, cropW, cropH,
+      });
     }
 
-    // Clamp to image bounds (safety)
+    // Clamp to photo bounds
     const safeOriginX = Math.max(0, Math.min(imgW - 1, originX));
     const safeOriginY = Math.max(0, Math.min(imgH - 1, originY));
-    const safeW       = Math.min(imgW - safeOriginX, cropW);
-    const safeH       = Math.min(imgH - safeOriginY, cropH);
+    const safeW       = Math.min(imgW - safeOriginX, Math.max(1, cropW));
+    const safeH       = Math.min(imgH - safeOriginY, Math.max(1, cropH));
 
-    console.log("[CROP] applying crop", {
+    clog("crop-512-clamped", {
+      platform: Platform.OS,
       safeOriginX, safeOriginY, safeW, safeH, imgW, imgH,
-      bboxCx: bbox.cx.toFixed(3), bboxCy: bbox.cy.toFixed(3),
-      bboxW: bbox.w.toFixed(3), bboxH: bbox.h.toFixed(3),
     });
 
+    const manipStart = Date.now();
     const result = await ImageManipulator.manipulateAsync(
       uri,
-      [{ crop: {
-        originX: safeOriginX,
-        originY: safeOriginY,
-        width:   safeW,
-        height:  safeH,
-      }}],
+      [
+        { crop: { originX: safeOriginX, originY: safeOriginY, width: safeW, height: safeH } },
+        { resize: { width: GUIDE_BOX_SIZE, height: GUIDE_BOX_SIZE } },
+      ],
       { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
     );
+    const manipMs = Date.now() - manipStart;
+    const totalMs = Date.now() - cropStart;
+
+    clog("crop-512-done", {
+      platform: Platform.OS,
+      outputUri:   result.uri,
+      outputSize:  `${GUIDE_BOX_SIZE}x${GUIDE_BOX_SIZE}`,
+      manipMs,
+      totalCropMs: totalMs,
+    });
+
     return result.uri ?? uri;
-  } catch (err) {
-    console.warn("[CROP] error, returning full image:", err);
+
+  } catch (err: any) {
+    const totalMs = Date.now() - cropStart;
+    clog("crop-512-error", { error: err?.message ?? String(err), totalMs });
     return uri;
   }
 }
@@ -280,6 +459,7 @@ async function cropByBBox(uri: string, bbox: BBoxState): Promise<string> {
 // ─────────────────────────────────────────────────────────────────
 export default function EyeCaptureScreen() {
   const router = useRouter();
+  const sessionStartRef = useRef(Date.now());
 
   const params = useLocalSearchParams<{
     name?: string;
@@ -296,90 +476,230 @@ export default function EyeCaptureScreen() {
   const eyeSide = (params.eyeSide ?? "left") as "left" | "right";
 
   const { hasPermission, requestPermission } = useCameraPermission();
-  const [facing, setFacing] = useState<"front" | "back">(
-    Platform.OS === "android" ? "back" : "front"
-  );
-  const [isDetected, setIsDetected] = useState(false);
-  const [debugInfo, setDebugInfo]   = useState("Waiting...");
-  const [camReady, setCamReady]     = useState(false);
-  const [lang, setLang]             = useState<Lang>("en");
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [capturing, setCapturing]   = useState(false);
-  const [quality, setQuality]       = useState<QualityState>({
+
+  const [facing, setFacing] = useState<"front" | "back">("front");
+
+  const [eyeConfirmed, setEyeConfirmed] = useState(false);
+  const [debugInfo, setDebugInfo]       = useState("Waiting...");
+  const [camReady, setCamReady]         = useState(false);
+  const [lang, setLang]                 = useState<Lang>("en");
+  const [isSpeaking, setIsSpeaking]     = useState(false);
+  const [capturing, setCapturing]       = useState(false);
+  const [quality, setQuality]           = useState<QualityState>({
     blurScore: 0, blurStatus: "blurry",
     brightness: 0, lightStatus: "low",
     cct: 5500, tempStatus: "good",
   });
+  const [detectedBox, setDetectedBox]   = useState<DetectedBox | null>(null);
 
-  // ── BBox ref ────────────────────────────────────────────────────
-  // Written from the frame-processor via runOnJS every frame that has
-  // a valid detection.  Read in handleCapture AFTER takePhoto resolves
-  // so there is zero race condition — the photo is already on disk by
-  // the time we look at this value.
-  const latestBBoxRef = useRef<BBoxState>(EMPTY_BBOX);
+  const prevQualityRef  = useRef<QualityState | null>(null);
+  const prevProblemKey  = useRef<string | null>(null);
 
-  // Auto-capture timer
-  const autoCaptureTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [autoCapturePending, setAutoCapturePending] = useState(false);
+  const frameDimsRef = useRef<FrameDims>({
+    rawW:     1080,
+    rawH:     1920,
+    rotation: ROTATION_CONFIG[PLATFORM_KEY]["front"],
+    mirror:   MIRROR_CONFIG[PLATFORM_KEY]["front"],
+  });
 
-  const lastSpokenKey  = useRef<string | null>(null);
-  const lastSpokenTime = useRef<number>(0);
-  const cameraRef      = useRef<any>(null);
+  const lastSpokenKey   = useRef<string | null>(null);
+  const lastSpokenTime  = useRef<number>(0);
+  const cameraRef       = useRef<any>(null);
+  const hasFiredCapture = useRef(false);
+
+  const jsFrameCountRef   = useRef(0);
+  const confirmedFrameRef = useRef<number | null>(null);
 
   const backDevice  = useCameraDevice("back");
   const frontDevice = useCameraDevice("front");
   const device      = facing === "back" ? backDevice : frontDevice;
 
   const { model, state } = useTensorflowModel(
-    require("../assets/model/conjuctiva.tflite")
-    // require("../assets/model/best_float32_conjunctiva.tflite")
+    require("../assets/model/11-06-2026-yolo-26-n-best_float32.tflite")
   );
   const { resize } = useResizePlugin();
 
-  // Worklet-side shared values (used ONLY inside the frame processor)
-  const smoothedScore  = useSharedValue(0);
-  const stableOnCount  = useSharedValue(0);
-  const stableOffCount = useSharedValue(0);
-  const confirmedState = useSharedValue(0);
-  const isFrontCam     = useSharedValue(0);
-  const frameCounter   = useSharedValue(0);
+  const frameWindow      = useSharedValue<number[]>([]);
+  const frameCounter     = useSharedValue(0);
+  const isFrontCam       = useSharedValue(0);
+  const eyeConfirmedSV   = useSharedValue(0);
 
-  useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission]);
-  useEffect(() => () => { Speech.stop(); }, []);
+  // ── Startup log ───────────────────────────────────────────────
+  useEffect(() => {
+    clog("app-init", {
+      eyeSide,
+      platform:   Platform.OS,
+      defaultCam: facing,
+      sessionId:  params.eyeSessionId ?? "none",
+      patient:    params.name ?? "unknown",
+      age:        params.age  ?? "unknown",
+      gender:     params.gender ?? "unknown",
+      modelInput: MODEL_INPUT_SIZE,
+      guideBox:   GUIDE_BOX_SIZE,
+      confThresh: CONF_THRESHOLD,
+      bestOf:     BEST_OF_FRAMES,
+      blurThresh: BLUR_THRESHOLD,
+      briLow:     BRIGHTNESS_LOW,
+      briHigh:    BRIGHTNESS_HIGH,
+      cctWarm:    CCT_WARM_THRESHOLD,
+      rotationConfig: ROTATION_CONFIG[PLATFORM_KEY],
+      mirrorConfig:   MIRROR_CONFIG[PLATFORM_KEY],
+    });
+  }, []);
 
   useEffect(() => {
-    isFrontCam.value     = facing === "front" ? 1 : 0;
-    smoothedScore.value  = 0;
-    stableOnCount.value  = 0;
-    stableOffCount.value = 0;
-    confirmedState.value = 0;
-    frameCounter.value   = 0;
-    latestBBoxRef.current = EMPTY_BBOX;
-    setIsDetected(false);
+    clog("model-state", { state, eyeSide });
+  }, [state]);
+
+  useEffect(() => {
+    if (!hasPermission) {
+      clog("permission", { status: "requesting" });
+      requestPermission().then((granted) => {
+        clog("permission", { status: granted ? "granted" : "denied" });
+      });
+    } else {
+      clog("permission", { status: "already-granted" });
+    }
+  }, [hasPermission]);
+
+  useEffect(() => () => {
+    const sessionMs = Date.now() - sessionStartRef.current;
+    clog("session-info", {
+      eyeSide,
+      totalSessionMs: sessionMs,
+      totalFrames:    jsFrameCountRef.current,
+      confirmedAtFrame: confirmedFrameRef.current,
+      avgFps: jsFrameCountRef.current > 0
+        ? +(jsFrameCountRef.current / (sessionMs / 1000)).toFixed(1)
+        : 0,
+    });
+    Speech.stop();
+  }, []);
+
+  useEffect(() => {
+    const camKey = facing === "front" ? "front" : "back";
+    isFrontCam.value        = facing === "front" ? 1 : 0;
+    frameWindow.value       = [];
+    frameCounter.value      = 0;
+    eyeConfirmedSV.value    = 0;
+    hasFiredCapture.current = false;
+    jsFrameCountRef.current = 0;
+    confirmedFrameRef.current = null;
+    setEyeConfirmed(false);
     setCamReady(false);
+    setDetectedBox(null);
     setDebugInfo(`Switching to ${facing}...`);
+
+    frameDimsRef.current = {
+      rawW:     1080,
+      rawH:     1920,
+      rotation: ROTATION_CONFIG[PLATFORM_KEY][camKey],
+      mirror:   MIRROR_CONFIG[PLATFORM_KEY][camKey],
+    };
+
+    clog("camera-switch", {
+      to:      facing,
+      eyeSide,
+      device:  facing === "back" ? backDevice?.id : frontDevice?.id,
+    });
+
     const delay = facing === "back" ? 1400 : 800;
-    const t = setTimeout(() => setCamReady(true), delay);
+    const t     = setTimeout(() => setCamReady(true), delay);
     return () => clearTimeout(t);
   }, [facing]);
 
-  // runOnJS bridges
-  const setIsDetectedJS = Worklets.createRunOnJS(setIsDetected);
-  const setDebugInfoJS  = Worklets.createRunOnJS(setDebugInfo);
-  const setQualityJS    = Worklets.createRunOnJS(setQuality);
+  // ── Worklet → JS bridges ──────────────────────────────────────
+  const setEyeConfirmedJS = Worklets.createRunOnJS(setEyeConfirmed);
+  const setDebugInfoJS    = Worklets.createRunOnJS(setDebugInfo);
+  const setQualityJS      = Worklets.createRunOnJS(setQuality);
+  const setDetectedBoxJS  = Worklets.createRunOnJS(setDetectedBox);
 
-  // This bridge writes the latest bbox into the JS ref from the worklet.
-  // It is called with plain numbers so it is safe to cross the bridge.
-  const updateBBoxRef = Worklets.createRunOnJS(
-    (valid: boolean, cx: number, cy: number, w: number, h: number,
-     frameW: number, frameH: number) => {
-      latestBBoxRef.current = { valid, cx, cy, w, h, frameW, frameH };
+  const setFrameDimsJS = Worklets.createRunOnJS(
+    (rawW: number, rawH: number, rotation: RotationDeg, mirror: boolean) => {
+      frameDimsRef.current = { rawW, rawH, rotation, mirror };
+    }
+  );
+
+  const trackPerfJS = Worklets.createRunOnJS(
+    (resize: number, quality: number, infer: number, detect: number, total: number) => {
+      trackPerf("resize",  resize);
+      trackPerf("quality", quality);
+      trackPerf("infer",   infer);
+      trackPerf("detect",  detect);
+      trackPerf("total",   total);
+      jsFrameCountRef.current += 1;
+    }
+  );
+
+  const logPerfSummaryJS = Worklets.createRunOnJS(
+    (frame: number, cam: string) => {
+      clog("frame-perf-summary", {
+        cam,
+        frame,
+        totalFrames:    jsFrameCountRef.current,
+        avg: {
+          resizeMs:  +avgPerf("resize").toFixed(1),
+          qualityMs: +avgPerf("quality").toFixed(1),
+          inferMs:   +avgPerf("infer").toFixed(1),
+          detectMs:  +avgPerf("detect").toFixed(1),
+          totalMs:   +avgPerf("total").toFixed(1),
+        },
+        p95: {
+          resizeMs:  +p95Perf("resize").toFixed(1),
+          qualityMs: +p95Perf("quality").toFixed(1),
+          inferMs:   +p95Perf("infer").toFixed(1),
+          detectMs:  +p95Perf("detect").toFixed(1),
+          totalMs:   +p95Perf("total").toFixed(1),
+        },
+        estFps: jsFrameCountRef.current > 0
+          ? +(1000 / (avgPerf("total") || 1)).toFixed(1)
+          : 0,
+      });
+    }
+  );
+
+  const logQualityChangeJS = Worklets.createRunOnJS(
+    (prev: QualityState | null, next: QualityState, frame: number, cam: string) => {
+      const changed =
+        !prev ||
+        prev.lightStatus !== next.lightStatus ||
+        prev.blurStatus  !== next.blurStatus  ||
+        prev.tempStatus  !== next.tempStatus;
+
+      if (changed) {
+        clog("quality-change", {
+          cam, frame,
+          from: prev
+            ? { light: prev.lightStatus, blur: prev.blurStatus, temp: prev.tempStatus }
+            : null,
+          to: {
+            light: next.lightStatus,
+            blur:  next.blurStatus,
+            temp:  next.tempStatus,
+          },
+          metrics: {
+            brightness: +next.brightness.toFixed(1),
+            blurScore:  +next.blurScore.toFixed(1),
+            cct:        +next.cct.toFixed(0),
+          },
+        });
+        prevQualityRef.current = next;
+      }
     }
   );
 
   const speakNow = useCallback((key: string, l: Lang = lang) => {
     const entry = VOICE[key]?.[l];
     if (!entry) return;
+
+    const now = Date.now();
+    clog("voice-guidance", {
+      key, lang: l,
+      text:    entry.text,
+      bcp47:   entry.bcp47,
+      triggerTs: now,
+    });
+
     Speech.stop();
     setIsSpeaking(true);
     Speech.speak(entry.text, {
@@ -389,16 +709,28 @@ export default function EyeCaptureScreen() {
     });
   }, [lang]);
 
-  // ── allGood gate ───────────────────────────────────────────────
-  const allGood =
-    isDetected &&
+  const qualityGood =
     quality.blurStatus  === "good" &&
     quality.lightStatus === "good" &&
     quality.tempStatus  === "good";
 
+  const allGood    = eyeConfirmed && qualityGood;
   const problemKey = getProblemKey(
-    isDetected, quality.lightStatus, quality.blurStatus, quality.tempStatus
+    eyeConfirmed, quality.lightStatus, quality.blurStatus, quality.tempStatus
   );
+
+  useEffect(() => {
+    if (problemKey !== prevProblemKey.current) {
+      clog("voice-guidance", {
+        event:   "key-change",
+        from:    prevProblemKey.current,
+        to:      problemKey,
+        frame:   jsFrameCountRef.current,
+        eyeSide,
+      });
+      prevProblemKey.current = problemKey;
+    }
+  }, [problemKey]);
 
   useEffect(() => {
     const now = Date.now();
@@ -409,61 +741,108 @@ export default function EyeCaptureScreen() {
     }
   }, [problemKey, lang, speakNow]);
 
-  // ── Auto-capture logic ─────────────────────────────────────────
-  useEffect(() => {
-    if (allGood && !capturing) {
-      setAutoCapturePending(true);
-      autoCaptureTimer.current = setTimeout(() => {
-        setAutoCapturePending(false);
-        handleCapture();
-      }, AUTO_CAPTURE_DELAY);
-    } else {
-      if (autoCaptureTimer.current) {
-        clearTimeout(autoCaptureTimer.current);
-        autoCaptureTimer.current = null;
-      }
-      setAutoCapturePending(false);
-    }
-    return () => {
-      if (autoCaptureTimer.current) {
-        clearTimeout(autoCaptureTimer.current);
-        autoCaptureTimer.current = null;
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allGood, capturing]);
+  const handleLangChange = useCallback((l: Lang) => {
+    clog("lang-change", { from: lang, to: l, frame: jsFrameCountRef.current });
+    setLang(l);
+  }, [lang]);
 
-  // ── Capture handler ────────────────────────────────────────────
-  // Strategy:
-  //   1. takePhoto()  ← camera shutter
-  //   2. Read latestBBoxRef.current  ← no race; photo is on disk, frame
-  //      processor keeps running and has had ample time to write good data
-  //   3. cropByBBox() with the bbox that was current at step 2
+  // ── AUTO-CAPTURE ──────────────────────────────────────────────
+  useEffect(() => {
+    if (eyeConfirmed && qualityGood && !capturing && !hasFiredCapture.current) {
+      hasFiredCapture.current = true;
+      const waitMs = Date.now() - sessionStartRef.current;
+      clog("auto-capture-trigger", {
+        eyeSide,
+        qualityGood,
+        totalFrames:  jsFrameCountRef.current,
+        waitMs,
+        confirmedAtFrame: confirmedFrameRef.current,
+        quality: {
+          blurScore:   +quality.blurScore.toFixed(1),
+          blurStatus:  quality.blurStatus,
+          brightness:  +quality.brightness.toFixed(1),
+          lightStatus: quality.lightStatus,
+          cct:         +quality.cct.toFixed(0),
+          tempStatus:  quality.tempStatus,
+        },
+      });
+      handleCapture();
+    }
+  }, [eyeConfirmed, qualityGood, capturing]);
+
+  // ── Capture handler ───────────────────────────────────────────
   const handleCapture = useCallback(async () => {
-    if (capturing || !cameraRef.current) return;
+    if (capturing || !cameraRef.current) {
+      clog("capture-aborted", {
+        reason: capturing ? "already-capturing" : "no-camera-ref",
+        eyeSide,
+      });
+      return;
+    }
     setCapturing(true);
     Speech.stop();
 
+    const captureStart = Date.now();
+    const currentDims  = frameDimsRef.current;
+
+    clog("capture-start", {
+      eyeSide,
+      facing,
+      frame:        jsFrameCountRef.current,
+      rawW:         currentDims.rawW,
+      rawH:         currentDims.rawH,
+      rotation:     currentDims.rotation,
+      mirror:       currentDims.mirror,
+      sessionMs:    captureStart - sessionStartRef.current,
+      qualityAtCapture: {
+        blurScore:   +quality.blurScore.toFixed(1),
+        blurStatus:  quality.blurStatus,
+        brightness:  +quality.brightness.toFixed(1),
+        lightStatus: quality.lightStatus,
+        cct:         +quality.cct.toFixed(0),
+        tempStatus:  quality.tempStatus,
+      },
+    });
+
     try {
-      // Step 1 — take the photo
+      const photoStart = Date.now();
       const photo = await cameraRef.current.takePhoto({
         qualityPrioritization: "balanced",
         flash: "off",
         enableAutoRedEyeReduction: false,
       });
+      const photoMs = Date.now() - photoStart;
 
       const uri = Platform.OS === "android"
         ? `file://${photo.path}`
         : photo.path;
 
-      // Step 2 — read the LATEST bbox the frame processor wrote.
-      // takePhoto is async (can be 200-600 ms) so by now the frame
-      // processor has had many more frames to refine the detection.
-      const bbox = latestBBoxRef.current;
-      console.log("[CAPTURE] bbox at photo-ready time:", JSON.stringify(bbox));
+      clog("capture-photo-done", {
+        eyeSide,
+        photoMs,
+        rawW:        currentDims.rawW,
+        rawH:        currentDims.rawH,
+        rotation:    currentDims.rotation,
+        photoWidth:  photo.width,
+        photoHeight: photo.height,
+        uri,
+      });
 
-      // Step 3 — crop
-      const croppedUri = await cropByBBox(uri, bbox);
+      const croppedUri = await cropGuideBoxTo512(uri, currentDims);
+
+      const totalMs = Date.now() - captureStart;
+      clog("capture-complete", {
+        eyeSide,
+        totalMs,
+        photoMs,
+        croppedUri,
+        sessionMs: Date.now() - sessionStartRef.current,
+        totalFrames: jsFrameCountRef.current,
+        avgInferMs:  +avgPerf("infer").toFixed(1),
+        avgTotalMs:  +avgPerf("total").toFixed(1),
+        p95InferMs:  +p95Perf("infer").toFixed(1),
+        p95TotalMs:  +p95Perf("total").toFixed(1),
+      });
 
       router.replace({
         pathname: "/",
@@ -479,14 +858,23 @@ export default function EyeCaptureScreen() {
         },
       });
     } catch (err: any) {
-      console.error("[CAPTURE] error:", err);
+      const totalMs = Date.now() - captureStart;
+      clog("capture-error", {
+        eyeSide,
+        error:   err?.message ?? String(err),
+        totalMs,
+      });
+      hasFiredCapture.current = false;
+    } finally {
       setCapturing(false);
     }
-  }, [capturing, eyeSide, params, router]);
+  }, [capturing, eyeSide, params, router, quality, facing]);
 
-  // ── Frame processor ────────────────────────────────────────────
+  // ── Frame processor ───────────────────────────────────────────
   const frameProcessor = useFrameProcessor((frame) => {
     "worklet";
+
+    const startTotal = Date.now();
     frameCounter.value += 1;
     const f       = frameCounter.value;
     const isFront = isFrontCam.value === 1;
@@ -494,26 +882,69 @@ export default function EyeCaptureScreen() {
 
     if (model == null || camReady === false) return;
 
-    let rotation: "0deg" | "90deg" | "180deg" | "270deg";
-    let mirror: boolean;
-    if (isFront) { rotation = FRONT_ROTATION; mirror = FRONT_MIRROR; }
-    else         { rotation = BACK_ROTATION;  mirror = false; }
+    const platformKey = Platform.OS === "android" ? "android" : "ios";
+    const camKey      = isFront ? "front" : "back";
+    const rotation: "0deg" | "90deg" | "180deg" | "270deg" =
+      ROTATION_CONFIG[platformKey][camKey];
+    const mirror: boolean = MIRROR_CONFIG[platformKey][camKey];
 
+    const rawFw = frame.width;
+    const rawFh = frame.height;
+
+    if (f === 1 || f % 60 === 0) {
+      setFrameDimsJS(rawFw, rawFh, rotation, mirror);
+    }
+
+    const is90or270 = rotation === "90deg" || rotation === "270deg";
+    const fw = is90or270 ? rawFh : rawFw;
+    const fh = is90or270 ? rawFw : rawFh;
+
+    if (f === 1) {
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "resize-diagnostic",
+        cam: tag,
+        platform: platformKey,
+        rawW: rawFw, rawH: rawFh,
+        logicalW: fw, logicalH: fh,
+        rotation, mirror,
+        note: "If detection fails on Android, cycle ROTATION_CONFIG[android][" + camKey +
+              "] through 0/90/180/270deg and toggle MIRROR_CONFIG, then rebuild.",
+      }));
+    }
+
+    const resizeStart = Date.now();
     let resized: any;
-    try {
+    let usedFallbackResize = false;
+
       resized = resize(frame, {
-        scale:       { width: MODEL_INPUT_SIZE, height: MODEL_INPUT_SIZE },
+        scale:{ width: MODEL_INPUT_SIZE, height: MODEL_INPUT_SIZE },
         pixelFormat: "rgb",
         dataType:    "float32",
         rotation,
         mirror,
       });
-    } catch (e: any) {
-      setDebugInfoJS(`[${tag}] resize fail: ${e?.message ?? "?"}`);
-      return;
+   
+    const resizeMs = Date.now() - resizeStart;
+
+    if (f === 1) {
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "resize",
+        cam: tag, frame: f,
+        frameRaw:     `${rawFw}x${rawFh}`,
+        frameLogical: `${fw}x${fh}`,
+        rotation, mirror,
+        resizeMs,
+        usedFallback: false,
+      }));
+    } else if (usedFallbackResize) {
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "resize",
+        cam: tag, frame: f, event: "fallback-used", resizeMs,
+      }));
     }
 
-    // ── Quality checks ──────────────────────────────────────────
+    // ── Step 2: Quality checks ───────────────────────────────────
+    const qualityStart = Date.now();
     const qd = resized as Float32Array;
     const qW = MODEL_INPUT_SIZE;
     const qH = MODEL_INPUT_SIZE;
@@ -521,14 +952,14 @@ export default function EyeCaptureScreen() {
     let lumaSum = 0, lumaCount = 0;
     for (let qy = 0; qy < qH; qy += Q_STEP) {
       for (let qx = 0; qx < qW; qx += Q_STEP) {
-        const b = (qy * qW + qx) * 3;
-        const r = qd[b] * 255, g = qd[b + 1] * 255, bv = qd[b + 2] * 255;
+        const b  = (qy * qW + qx) * 3;
+        const r  = qd[b] * 255, g = qd[b + 1] * 255, bv = qd[b + 2] * 255;
         lumaSum += 0.299 * r + 0.587 * g + 0.114 * bv;
         lumaCount++;
       }
     }
     const brightness = lumaCount > 0 ? lumaSum / lumaCount : 0;
-    const lightStatus: "good" | "low" | "high" =
+    const lightStatus: LightStatus =
       brightness < BRIGHTNESS_LOW  ? "low" :
       brightness > BRIGHTNESS_HIGH ? "high" : "good";
 
@@ -555,14 +986,14 @@ export default function EyeCaptureScreen() {
     }
     const blurMean  = lapCount > 0 ? lapSum / lapCount : 0;
     const blurScore = lapCount > 0 ? lapSumSq / lapCount - blurMean * blurMean : 0;
-    const blurStatus: "good" | "blurry" = blurScore >= BLUR_THRESHOLD ? "good" : "blurry";
+    const blurStatus: BlurStatus = blurScore >= BLUR_THRESHOLD ? "good" : "blurry";
 
     let cctSumX = 0, cctSumY = 0, cctSumZ = 0, cctValid = 0;
     for (let cy = 0; cy < qH; cy += Q_STEP) {
       for (let cx = 0; cx < qW; cx += Q_STEP) {
-        const b = (cy * qW + cx) * 3;
-        const rv = qd[b], gv = qd[b + 1], bv2 = qd[b + 2];
-        const r8 = rv * 255, g8 = gv * 255, b8 = bv2 * 255;
+        const b   = (cy * qW + cx) * 3;
+        const rv  = qd[b], gv = qd[b + 1], bv2 = qd[b + 2];
+        const r8  = rv * 255, g8 = gv * 255, b8 = bv2 * 255;
         const maxV = r8 > g8 ? (r8 > b8 ? r8 : b8) : (g8 > b8 ? g8 : b8);
         const minV = r8 < g8 ? (r8 < b8 ? r8 : b8) : (g8 < b8 ? g8 : b8);
         const sat  = maxV === 0 ? 0 : (maxV - minV) / maxV;
@@ -581,17 +1012,38 @@ export default function EyeCaptureScreen() {
       const Xv = cctSumX / cctValid, Yv = cctSumY / cctValid, Zv = cctSumZ / cctValid;
       const tot = Xv + Yv + Zv;
       if (tot > 0) {
-        const xc = Xv / tot, yc = Yv / tot;
+        const xc  = Xv / tot, yc = Yv / tot;
         const nc  = (xc - 0.3320) / (yc - 0.1858);
         const raw = -449 * nc * nc * nc + 3525 * nc * nc - 6823.3 * nc + 5520.33;
         cct = (raw < 2000 ? 2000 : raw > 10000 ? 10000 : raw) * CCT_WARM_BIAS;
       }
     }
-    const tempStatus: "good" | "warm" = cct < CCT_WARM_THRESHOLD ? "warm" : "good";
+    const tempStatus: TempStatus = cct < CCT_WARM_THRESHOLD ? "warm" : "good";
+    const qualityMs = Date.now() - qualityStart;
 
-    setQualityJS({ blurScore, blurStatus, brightness, lightStatus, cct, tempStatus });
+    const nextQuality = { blurScore, blurStatus, brightness, lightStatus, cct, tempStatus };
+    setQualityJS(nextQuality);
+    logQualityChangeJS(prevQualityRef.current, nextQuality, f, tag);
 
-    // ── Model inference ─────────────────────────────────────────
+    if (f % 15 === 0) {
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "quality-metrics",
+        cam: tag, frame: f,
+        brightness:  +brightness.toFixed(1),
+        lightStatus,
+        blurScore:   +blurScore.toFixed(2),
+        blurMean:    +blurMean.toFixed(2),
+        blurStatus,
+        cct:         +cct.toFixed(0),
+        cctValidPx:  cctValid,
+        tempStatus,
+        qualityMs,
+        allGood: lightStatus === "good" && blurStatus === "good" && tempStatus === "good",
+      }));
+    }
+
+    // ── Step 3: Model inference ───────────────────────────────────
+    const inferStart = Date.now();
     let outputs: any;
     try {
       outputs = model.runSync([resized]);
@@ -599,107 +1051,181 @@ export default function EyeCaptureScreen() {
       setDebugInfoJS(`[${tag}] infer fail: ${e?.message ?? "?"}`);
       return;
     }
-    if (!outputs || outputs.length === 0) return;
+    const inferMs = Date.now() - inferStart;
 
+    if (!outputs || outputs.length === 0) return;
     const raw = outputs[0] as Float32Array;
 
-    // Frame dimensions (needed for uncrop).
-    // IMPORTANT: frame.width/height are RAW sensor dimensions (e.g. 1920×1080
-    // landscape).  The resize plugin rotates the frame by `rotation` BEFORE
-    // cropping to a square, so the effective visual frame after rotation is
-    // 1080×1920 (portrait).  We must swap W↔H for 90°/270° rotations so that
-    // uncropBox works in the rotated (visual) coordinate space, which matches
-    // the normalised coords the model outputs.
-    const rawFw = frame.width;
-    const rawFh = frame.height;
-    const is90or270 = rotation === "90deg" || rotation === "270deg";
-    const fw = is90or270 ? rawFh : rawFw;   // visual width  after rotation
-    const fh = is90or270 ? rawFw : rawFh;   // visual height after rotation
+    // ── Step 4: Parse + validate detections ──────────────────────
+    const detectStart = Date.now();
+    let bestBoxScore   = 0;
+    let validCount     = 0;
+    let partialCount   = 0;
+    let areaFailCount  = 0;
+    let totalAboveConf = 0;
 
-    let bestBoxScore = 0;
-    let bestMx1 = 0, bestMy1 = 0, bestMx2 = 0, bestMy2 = 0;
-    let bestScore = 0;
-     
-    
+    let overlayBox: DetectedBox | null = null;
+    let overlayScore = -1;
+
     for (let i = 0; i < NUM_DETECTIONS; i++) {
       const base  = i * VALS_PER_BOX;
       const score = raw[base + 4];
-      if(bestScore <= score){
-        bestScore = score;
-      }
-
       if (score < 0.05) continue;
 
-      // Model output: cx, cy, w, h in model-normalised space
-      const mcx = raw[base + 0];
-      const mcy = raw[base + 1];
-      const mw  = raw[base + 2];
-      const mh  = raw[base + 3];
-      if (mw <= 0 || mh <= 0 || mw > 1.5 || mh > 1.5) continue;
+      const nx1 = raw[base + 0];
+      const ny1 = raw[base + 1];
+      const nx2 = raw[base + 2];
+      const ny2 = raw[base + 3];
+      const bw  = nx2 - nx1;
+      const bh  = ny2 - ny1;
+      if (bw <= 0 || bh <= 0 || bw > 1.5 || bh > 1.5) continue;
 
-      const area = mw * mh;
-      if (area < MIN_BOX_AREA || area > MAX_BOX_AREA) continue;
+      const bbox = validateBBox(nx1, ny1, nx2, ny2, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
 
-      if (score > bestBoxScore) {
-        bestBoxScore = score;
-        // Convert centre+wh → corners for uncrop
-        bestMx1 = mcx - mw / 2;
-        bestMy1 = mcy - mh / 2;
-        bestMx2 = mcx + mw / 2;
-        bestMy2 = mcy + mh / 2;
+      if (score >= CONF_THRESHOLD) {
+        totalAboveConf++;
+        if (bbox.type === "partial")  partialCount++;
+        else if (bbox.valid !== 1)    areaFailCount++;
       }
-      if (score > bestScore) bestScore = score;
+
+      if (BBOX_DEBUG_LOG && score >= CONF_THRESHOLD) {
+        if (bbox.type === "full") {
+          console.log(JSON.stringify({
+            ts: Date.now(), scope: "bbox",
+            cam: tag, frame: f,
+            x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2,
+            w: bbox.x2 - bbox.x1, h: bbox.y2 - bbox.y1,
+            type: "full",
+            area:    bbox.area,
+            areaPct: +(bbox.areaRatio * 100).toFixed(1),
+            areaMin: +(BBOX_MIN_AREA_RATIO * 100).toFixed(1),
+            areaMax: +(BBOX_MAX_AREA_RATIO * 100).toFixed(1),
+            valid:   bbox.valid === 1,
+            reason:  bbox.reason,
+            score:   +score.toFixed(3),
+          }));
+        } else {
+          console.log(JSON.stringify({
+            ts: Date.now(), scope: "bbox",
+            cam: tag, frame: f,
+            type: "partial",
+            reason: bbox.reason,
+            valid:  false,
+            score:  +score.toFixed(3),
+          }));
+        }
+      }
+
+      if (score > overlayScore) {
+        overlayScore = score;
+        overlayBox = {
+          x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2,
+          score,
+          type:      bbox.type,
+          valid:     bbox.valid === 1,
+          areaRatio: bbox.areaRatio,
+        };
+      }
+
+      if (bbox.valid !== 1) continue;
+      validCount++;
+      if (score > bestBoxScore) bestBoxScore = score;
+    }
+    const detectMs = Date.now() - detectStart;
+
+    if (f % 10 === 0 && totalAboveConf > 0) {
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "detection-summary",
+        cam: tag, frame: f,
+        totalAboveConf,
+        validCount,
+        partialCount,
+        areaFailCount,
+        bestScore:    +bestBoxScore.toFixed(3),
+        overlayScore: +overlayScore.toFixed(3),
+        confirmed:    eyeConfirmedSV.value === 1,
+        detectMs,
+      }));
     }
 
-    // ── Update bbox ref via runOnJS ──────────────────────────────
-    // Always update (even when confirmedState is 0) so that by the
-    // time takePhoto resolves we have the freshest possible data.
-    if (bestBoxScore > 0) {
-      // Map model-space corners → original frame normalised coords
-      const oc = uncropBox(bestMx1, bestMy1, bestMx2, bestMy2, fw, fh);
-
-      // Back to centre + wh
-      let ocx = (oc.x1 + oc.x2) / 2;
-      const ocy = (oc.y1 + oc.y2) / 2;
-      const ow  = oc.x2 - oc.x1;
-      const oh  = oc.y2 - oc.y1;
-
-      // Mirror X for front camera (resize plugin already mirrors the
-      // pixel data, but the coordinate system needs explicit flip)
-      if (isFront) ocx = 1 - ocx;
-
-      const cx = ocx < 0 ? 0 : ocx > 1 ? 1 : ocx;
-      const cy = ocy < 0 ? 0 : ocy > 1 ? 1 : ocy;
-      const cw = ow  < 0 ? 0 : ow  > 1 ? 1 : ow;
-      const ch = oh  < 0 ? 0 : oh  > 1 ? 1 : oh;
-
-      // Write to JS ref — safe from any thread via Worklets bridge
-      updateBBoxRef(true, cx, cy, cw, ch, fw, fh);
-
-      setDebugInfoJS(
-        `[${tag}] score:${bestBoxScore.toFixed(2)} cx:${cx.toFixed(3)} cy:${cy.toFixed(3)} ` +
-        `w:${cw.toFixed(3)} h:${ch.toFixed(3)} frame:${fw}×${fh}`
-      );
+    if (overlayScore >= CONF_THRESHOLD) {
+      setDetectedBoxJS(overlayBox);
     } else {
-      // No detection this frame — do NOT clear the ref so handleCapture
-      // can still use the last known good position.
-      if (f % 15 === 0) {
-        setDebugInfoJS(`[${tag}] no detection (smooth:${smoothedScore.value.toFixed(2)})`);
-      }
+      setDetectedBoxJS(null);
     }
 
-    // ── Stable detection state machine ───────────────────────────
-    smoothedScore.value = SMOOTHING * bestScore + (1 - SMOOTHING) * smoothedScore.value;
-    const isGoodFrame   = smoothedScore.value >= CONF_THRESHOLD;
-    if (isGoodFrame) { stableOnCount.value++;  stableOffCount.value = 0; }
-    else             { stableOffCount.value++; stableOnCount.value  = 0; }
+    // ── Step 5: Best-of-N window ──────────────────────────────────
+    const window = frameWindow.value;
+    window.push(bestBoxScore);
+    if (window.length > BEST_OF_FRAMES) window.shift();
+    frameWindow.value = window;
 
-    let newState = confirmedState.value;
-    if (confirmedState.value === 0 && stableOnCount.value  >= STABLE_FRAMES_ON)  newState = 1;
-    if (confirmedState.value === 1 && stableOffCount.value >= STABLE_FRAMES_OFF) newState = 0;
-    confirmedState.value = newState;
+    const allAbove =
+      window.length === BEST_OF_FRAMES &&
+      window.every((s) => s >= CONF_THRESHOLD);
 
-    setIsDetectedJS(newState === 1);
+    if (allAbove && eyeConfirmedSV.value === 0) {
+      eyeConfirmedSV.value = 1;
+      setEyeConfirmedJS(true);
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "eye-confirmed",
+        cam: tag, frame: f,
+        windowScores: window.map((s) => +s.toFixed(3)),
+        windowMin:    +Math.min(...window).toFixed(3),
+        windowAvg:    +(window.reduce((a, b) => a + b, 0) / window.length).toFixed(3),
+        inferMs,
+        resizeMs,
+        quality: {
+          brightness: +brightness.toFixed(1),
+          lightStatus,
+          blurScore:  +blurScore.toFixed(1),
+          blurStatus,
+          cct:        +cct.toFixed(0),
+          tempStatus,
+        },
+      }));
+    }
+
+    // ── Timing aggregation ────────────────────────────────────────
+    const totalMs = Date.now() - startTotal;
+    trackPerfJS(resizeMs, qualityMs, inferMs, detectMs, totalMs);
+
+    if (f % 30 === 0) {
+      console.log(JSON.stringify({
+        ts: Date.now(), scope: "frame-perf",
+        cam: tag, frame: f,
+        timing:    { totalMs, resizeMs, qualityMs, inferMs, detectMs },
+        detection: { bestScore: +bestBoxScore.toFixed(3), validCount, partialCount, areaFailCount, totalAboveConf },
+        window:    { scores: window.map((s) => +s.toFixed(3)), size: window.length, allAbove },
+        confirmed: eyeConfirmedSV.value === 1,
+        quality: {
+          brightness:  +brightness.toFixed(1), lightStatus,
+          blurScore:   +blurScore.toFixed(1),  blurStatus,
+          cct:         +cct.toFixed(0),         tempStatus,
+        },
+        frameMeta: {
+          rawW: rawFw, rawH: rawFh,
+          logicalW: fw, logicalH: fh,
+          rotation, mirror,
+          fallbackResize: usedFallbackResize,
+        },
+      }));
+      logPerfSummaryJS(f, tag);
+    }
+
+    if (bestBoxScore >= CONF_THRESHOLD) {
+      setDebugInfoJS(
+        `[${tag}] score:${bestBoxScore.toFixed(2)} ` +
+        `window:[${window.map(s => s.toFixed(2)).join(",")}] ` +
+        `confirmed:${eyeConfirmedSV.value === 1 ? "✅" : "⏳"}`
+      );
+    } else if (f % 15 === 0) {
+      setDebugInfoJS(
+        `[${tag}] no det score:${bestBoxScore.toFixed(2)} ` +
+        `window:[${window.map(s => s.toFixed(2)).join(",")}] ` +
+        `confirmed:${eyeConfirmedSV.value === 1 ? "✅" : "⏳"}`
+      );
+    }
   }, [model, camReady]);
 
   // ── Guards ─────────────────────────────────────────────────────
@@ -724,16 +1250,17 @@ export default function EyeCaptureScreen() {
   if (state === "error")
     return <View style={s.center}><Text style={[s.permText, { color: "#ff5555" }]}>❌ Model failed to load</Text></View>;
 
-  const instrText  = VOICE[problemKey]?.[lang]?.text ?? "";
-  const guideColor = allGood ? "#00ff66" : "#4c9fff";
-  const sideLabel  = eyeSide === "left" ? "LEFT EYE" : "RIGHT EYE";
+  const instrText         = VOICE[problemKey]?.[lang]?.text ?? "";
+  const guideColor        = allGood ? "#00ff66" : eyeConfirmed ? "#FFD700" : "#4c9fff";
+  const sideLabel         = eyeSide === "left" ? "LEFT EYE" : "RIGHT EYE";
+  const GUIDE_SCREEN_SIZE = 220;
 
   let captureBtnLabel = "Waiting…";
-  if (capturing)           captureBtnLabel = "Capturing…";
-  else if (autoCapturePending) captureBtnLabel = "📸 Auto…";
-  else if (allGood)        captureBtnLabel = "CAPTURE";
+  if (capturing)                         captureBtnLabel = "Capturing…";
+  else if (allGood)                      captureBtnLabel = "📸 Auto-capturing…";
+  else if (eyeConfirmed && !qualityGood) captureBtnLabel = "Eye ✅ — Fix quality";
+  else if (!eyeConfirmed)                captureBtnLabel = "Align eye…";
 
-  // ─────────────────────────────────────────────────────────────
   return (
     <View style={s.root}>
       <Camera
@@ -743,11 +1270,26 @@ export default function EyeCaptureScreen() {
         device={device}
         isActive={true}
         frameProcessor={frameProcessor}
-        // pixelFormat="rgb"
         photo={true}
-        onInitialized={() => { console.log(`[CAM] ${facing} initialized ✅`); setCamReady(true); }}
+        onInitialized={() => {
+          clog("camera-initialized", {
+            facing,
+            deviceId:   device?.id,
+            deviceName: device?.name,
+            hasFlash:   device?.hasFlash,
+            minZoom:    device?.minZoom,
+            maxZoom:    device?.maxZoom,
+            formats:    device?.formats?.length ?? 0,
+            initMs:     Date.now() - sessionStartRef.current,
+          });
+          setCamReady(true);
+        }}
         onError={(e) => {
-          console.error(`[CAM ERROR] ${facing}: ${e.message}`);
+          clog("camera-error", {
+            facing,
+            error: e.message,
+            code:  (e as any).code,
+          });
           setDebugInfo(`Cam error: ${e.message}`);
           setCamReady(false);
           setTimeout(() => setCamReady(true), 1200);
@@ -783,7 +1325,7 @@ export default function EyeCaptureScreen() {
                     idx === 2 && s.radioBtnLast,
                     lang === l && s.radioBtnActive,
                   ]}
-                  onPress={() => setLang(l)}
+                  onPress={() => handleLangChange(l)}
                 >
                   <Text style={[s.radioLabel, lang === l && s.radioLabelActive]}>
                     {l === "en" ? "EN" : l === "hi" ? "हि" : "తె"}
@@ -794,17 +1336,27 @@ export default function EyeCaptureScreen() {
 
             <TouchableOpacity
               style={s.flipBtn}
-              onPress={() => { setCamReady(false); setFacing(f => f === "front" ? "back" : "front"); }}
+              onPress={() => {
+                const next = facing === "front" ? "back" : "front";
+                clog("camera-flip", {
+                  from:        facing,
+                  to:          next,
+                  frame:       jsFrameCountRef.current,
+                  eyeConfirmed,
+                });
+                setCamReady(false);
+                setFacing(f => f === "front" ? "back" : "front");
+              }}
             >
               <IconFlip size={16} color="#fff" />
             </TouchableOpacity>
           </View>
         </View>
 
-        {/* Quality indicators */}
+        {/* Indicators */}
         <View style={s.indicatorRow}>
           {[
-            { icon: <IconEye   size={18} color="#fff" />, label: "EYE",   ok: isDetected },
+            { icon: <IconEye   size={18} color="#fff" />, label: "EYE",   ok: eyeConfirmed },
             { icon: <IconLight size={18} color="#fff" />, label: "LIGHT", ok: quality.lightStatus === "good" },
             { icon: <IconBlur  size={18} color="#fff" />, label: "SHARP", ok: quality.blurStatus  === "good" },
             { icon: <IconLight size={18} color="#fff" />, label: "COLOR", ok: quality.tempStatus  === "good" },
@@ -816,14 +1368,13 @@ export default function EyeCaptureScreen() {
           ))}
         </View>
 
-        {/* Instruction */}
-        <View style={[s.instrBox, { borderColor: allGood ? "#00e676" : "rgba(255,255,255,0.15)" }]}>
+        <View style={[s.instrBox, { borderColor: allGood ? "#00e676" : eyeConfirmed ? "#FFD700" : "rgba(255,255,255,0.15)" }]}>
           {isSpeaking && (
             <View style={s.speakingDot}>
               <View style={[s.speakingPulse, { backgroundColor: allGood ? "#00e676" : "#f4a97f" }]} />
             </View>
           )}
-          <Text style={[s.instrText, { color: allGood ? "#00e676" : "#fff" }]}>{instrText}</Text>
+          <Text style={[s.instrText, { color: allGood ? "#00e676" : eyeConfirmed ? "#FFD700" : "#fff" }]}>{instrText}</Text>
           <TouchableOpacity style={s.speakBtn} onPress={() => speakNow(problemKey)}>
             <IconSpeaker size={20} color={allGood ? "#00e676" : "#fff"} />
           </TouchableOpacity>
@@ -834,9 +1385,9 @@ export default function EyeCaptureScreen() {
         </View>
       </View>
 
-      {/* Guide box */}
+      {/* CAMERA WINDOW */}
       <View style={s.cameraWindow}>
-        <View style={[s.guide, { borderColor: guideColor }]}>
+        <View style={[s.guide, { borderColor: guideColor, width: GUIDE_SCREEN_SIZE, height: GUIDE_SCREEN_SIZE }]}>
           {(["TL", "TR", "BL", "BR"] as const).map((c) => (
             <View key={c} style={[s.corner, (s as any)[`corner${c}`], { borderColor: guideColor }]} />
           ))}
@@ -844,29 +1395,45 @@ export default function EyeCaptureScreen() {
           <View style={s.horizontalLine} />
           <View style={[s.centerDot, { borderColor: guideColor }]} />
         </View>
+        <Text style={s.guideLabel}>512 × 512</Text>
+        {detectedBox && (
+          <Text style={[s.guideLabel, {
+            color: detectedBox.valid
+              ? "#00e676"
+              : detectedBox.type === "partial"
+              ? "#ff5252"
+              : "#ffb74d"
+          }]}>
+            {detectedBox.type === "partial"
+              ? "partial — touching border"
+              : `${detectedBox.valid ? "valid" : "full — area out of range"} · area ${(detectedBox.areaRatio * 100).toFixed(1)}% · score ${detectedBox.score.toFixed(2)}`}
+          </Text>
+        )}
       </View>
 
-      {/* Capture area */}
+      {/* BOTTOM AREA */}
       <View style={s.captureArea}>
         <Text style={s.debugText}>{debugInfo}</Text>
         <Text style={s.debugText}>
           Blur:{quality.blurScore.toFixed(0)} | Bright:{quality.brightness.toFixed(0)} |{" "}
-          {quality.cct.toFixed(0)}K | cam:{facing} | ready:{camReady ? "✅" : "⏳"} |{" "}
-          bbox:{latestBBoxRef.current.valid ? "✅" : "❌"}
+          {quality.cct.toFixed(0)}K | cam:{facing} | ready:{camReady ? "✅" : "⏳"} | eye:{eyeConfirmed ? "✅" : "⏳"}
         </Text>
-
-        {autoCapturePending && (
-          <View style={s.autoBarTrack}>
-            <View style={s.autoBarFill} />
-          </View>
-        )}
+        <Text style={s.debugText}>
+          avg infer:{avgPerf("infer").toFixed(0)}ms | avg total:{avgPerf("total").toFixed(0)}ms |{" "}
+          p95 total:{p95Perf("total").toFixed(0)}ms | frames:{jsFrameCountRef.current}
+        </Text>
+        <Text style={s.debugText}>
+          rawDims:{frameDimsRef.current.rawW}×{frameDimsRef.current.rawH} |{" "}
+          rot:{frameDimsRef.current.rotation} | mir:{frameDimsRef.current.mirror ? "Y" : "N"} |{" "}
+          plat:{Platform.OS}
+        </Text>
 
         <TouchableOpacity
           style={[
             s.captureBtn,
             {
-              backgroundColor: allGood ? "#00c853" : "#2a2a2a",
-              borderColor: allGood ? (autoCapturePending ? "#fff" : "#00ff66") : "#444",
+              backgroundColor: allGood ? "#00c853" : eyeConfirmed ? "#7c4dff" : "#2a2a2a",
+              borderColor:     allGood ? "#00ff66" : eyeConfirmed ? "#b39ddb" : "#444",
             },
             capturing && { opacity: 0.6 },
           ]}
@@ -877,7 +1444,7 @@ export default function EyeCaptureScreen() {
           {capturing ? (
             <ActivityIndicator color="#fff" />
           ) : (
-            <Text style={[s.captureBtnText, { opacity: allGood ? 1 : 0.4 }]}>
+            <Text style={[s.captureBtnText, { opacity: eyeConfirmed ? 1 : 0.4 }]}>
               {captureBtnLabel}
             </Text>
           )}
@@ -911,7 +1478,7 @@ const s = StyleSheet.create({
   backBtn:     { paddingVertical: 7, paddingHorizontal: 14, borderRadius: 10, backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
   backBtnText: { color: "#fff", fontSize: 13, fontWeight: "600" },
 
-  sideLabel: { backgroundColor: "rgba(91,45,142,0.8)", paddingVertical: 5, paddingHorizontal: 14, borderRadius: 20 },
+  sideLabel:     { backgroundColor: "rgba(91,45,142,0.8)", paddingVertical: 5, paddingHorizontal: 14, borderRadius: 20 },
   sideLabelText: { color: "#fff", fontWeight: "700", fontSize: 13, letterSpacing: 1 },
 
   rightControls: { flexDirection: "row", alignItems: "center", gap: 8 },
@@ -955,12 +1522,14 @@ const s = StyleSheet.create({
   hintBox:  { backgroundColor: "rgba(255,255,255,0.06)", borderRadius: 10, paddingVertical: 7, paddingHorizontal: 12 },
   hintText: { color: "rgba(255,255,255,0.55)", fontSize: 11, textAlign: "center" },
 
-  cameraWindow: { flex: 1, justifyContent: "center", alignItems: "center" },
+  cameraWindow: { flex: 1, justifyContent: "center", alignItems: "center", gap: 8 },
+
   guide: {
-    width: 260, height: 240,
-    borderWidth: 2, borderRadius: 20, borderStyle: "dashed",
+    borderWidth: 2, borderRadius: 16, borderStyle: "dashed",
     justifyContent: "center", alignItems: "center",
   },
+  guideLabel: { color: "rgba(255,255,255,0.35)", fontSize: 11, fontFamily: "monospace" },
+
   corner:   { position: "absolute", width: 22, height: 22, borderWidth: 3 },
   cornerTL: { top: -2,    left: -2,   borderBottomWidth: 0, borderRightWidth: 0, borderTopLeftRadius: 8 },
   cornerTR: { top: -2,    right: -2,  borderBottomWidth: 0, borderLeftWidth: 0,  borderTopRightRadius: 8 },
@@ -973,16 +1542,6 @@ const s = StyleSheet.create({
   captureArea: {
     paddingVertical: 16, alignItems: "center", gap: 6,
     backgroundColor: "rgba(0,0,0,0.65)",
-  },
-
-  autoBarTrack: {
-    width: 200, height: 4, borderRadius: 2,
-    backgroundColor: "rgba(255,255,255,0.15)", overflow: "hidden",
-  },
-  autoBarFill: {
-    height: "100%", borderRadius: 2,
-    backgroundColor: "#00ff66",
-    width: "100%",
   },
 
   captureBtn:     { paddingVertical: 18, paddingHorizontal: 56, borderRadius: 80, borderWidth: 2, alignItems: "center", justifyContent: "center", minWidth: 200, minHeight: 60 },
