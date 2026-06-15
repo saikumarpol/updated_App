@@ -506,68 +506,118 @@ async function cropGuideBoxTo512(
       ),
     );
 
-    const is90or270 = rotation === "90deg" || rotation === "270deg";
-    const logicalW = is90or270 ? rawH : rawW;
-    const logicalH = is90or270 ? rawW : rawH;
+    if (Platform.OS === "android") {
+      const is90or270 = rotation === "90deg" || rotation === "270deg";
+      const logicalW = is90or270 ? rawH : rawW;
+      const logicalH = is90or270 ? rawW : rawH;
 
-    // Scaling factor: how many photo pixels correspond to one logical preview pixel.
-    // We use the minimum dimension as a stable reference for portrait-first UI.
-    const scale = Math.min(imgW, imgH) / Math.min(logicalW, logicalH);
+      // Scaling factor: how many photo pixels correspond to one logical preview pixel.
+      // We use the minimum dimension as a stable reference for portrait-first UI.
+      const scale = Math.min(imgW, imgH) / Math.min(logicalW, logicalH);
 
-    // The crop size in photo pixels should match the GUIDE_SCREEN_SIZE (220) seen by the user.
-    const cropSize = Math.round(GUIDE_SCREEN_SIZE * scale);
+      // The crop size in photo pixels should match the GUIDE_SCREEN_SIZE (220) seen by the user.
+      const cropSize = Math.round(GUIDE_SCREEN_SIZE * scale);
 
-    const originX = Math.round(imgW / 2 - cropSize / 2);
-    const originY = Math.round(imgH / 2 - cropSize / 2);
+      const originX = Math.round(imgW / 2 - cropSize / 2);
+      const originY = Math.round(imgH / 2 - cropSize / 2);
 
-    const safeOriginX = Math.max(0, Math.min(imgW - 1, originX));
-    const safeOriginY = Math.max(0, Math.min(imgH - 1, originY));
-    const safeW = Math.min(imgW - safeOriginX, Math.max(1, cropSize));
-    const safeH = Math.min(imgH - safeOriginY, Math.max(1, cropSize));
+      const safeOriginX = Math.max(0, Math.min(imgW - 1, originX));
+      const safeOriginY = Math.max(0, Math.min(imgH - 1, originY));
+      const safeW = Math.min(imgW - safeOriginX, Math.max(1, cropSize));
+      const safeH = Math.min(imgH - safeOriginY, Math.max(1, cropSize));
 
-    clog("crop-512-input", {
-      platform: Platform.OS,
-      rawW,
-      rawH,
-      rotation,
-      logicalW,
-      logicalH,
-      imgW,
-      imgH,
-      scale: +scale.toFixed(3),
-      originX,
-      originY,
-      cropSize,
-    });
+      clog("crop-512-input", {
+        platform: Platform.OS,
+        rawW,
+        rawH,
+        rotation,
+        logicalW,
+        logicalH,
+        imgW,
+        imgH,
+        scale: +scale.toFixed(3),
+        originX,
+        originY,
+        cropSize,
+      });
 
-    const manipStart = Date.now();
-    const result = await ImageManipulator.manipulateAsync(
-      uri,
-      [
-        {
-          crop: {
-            originX: safeOriginX,
-            originY: safeOriginY,
-            width: safeW,
-            height: safeH,
+      const manipStart = Date.now();
+      const result = await ImageManipulator.manipulateAsync(
+        uri,
+        [
+          {
+            crop: {
+              originX: safeOriginX,
+              originY: safeOriginY,
+              width: safeW,
+              height: safeH,
+            },
           },
-        },
-        { resize: { width: GUIDE_BOX_SIZE, height: GUIDE_BOX_SIZE } },
-      ],
-      { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
-    );
-    const manipMs = Date.now() - manipStart;
-    const totalMs = Date.now() - cropStart;
+          { resize: { width: GUIDE_BOX_SIZE, height: GUIDE_BOX_SIZE } },
+        ],
+        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
+      );
+      const manipMs = Date.now() - manipStart;
+      const totalMs = Date.now() - cropStart;
 
-    clog("crop-512-done", {
-      platform: Platform.OS,
-      outputUri: result.uri,
-      outputSize: `${GUIDE_BOX_SIZE}x${GUIDE_BOX_SIZE}`,
-      manipMs,
-      totalCropMs: totalMs,
-    });
+      clog("crop-512-done", {
+        platform: Platform.OS,
+        outputUri: result.uri,
+        outputSize: `${GUIDE_BOX_SIZE}x${GUIDE_BOX_SIZE}`,
+        manipMs,
+        totalCropMs: totalMs,
+      });
 
-    return result.uri ?? uri;
+      return result.uri ?? uri;
+    } else {
+      let originX: number;
+      let originY: number;
+      let cropW: number;
+      let cropH: number;
+
+      // Photo pixel dimensions match the logical (rotated) frame.
+      // Logical frame dims (what the model sees as upright):
+      const is90or270 = rotation === "90deg" || rotation === "270deg";
+      const logicalW = is90or270 ? rawH : rawW;
+      const logicalH = is90or270 ? rawW : rawH;
+
+      // Scale from logical frame → photo pixels
+      const scaleX = imgW / logicalW;
+      const scaleY = imgH / logicalH;
+      const half = GUIDE_BOX_SIZE / 2;
+
+      originX = Math.round((logicalW / 2 - half) * scaleX);
+      originY = Math.round((logicalH / 2 - half) * scaleY);
+      cropW = Math.round(GUIDE_BOX_SIZE * scaleX);
+      cropH = Math.round(GUIDE_BOX_SIZE * scaleY);
+
+      // Clamp to photo bounds
+      const safeOriginX = Math.max(0, Math.min(imgW - 1, originX));
+      const safeOriginY = Math.max(0, Math.min(imgH - 1, originY));
+      const safeW = Math.min(imgW - safeOriginX, Math.max(1, cropW));
+      const safeH = Math.min(imgH - safeOriginY, Math.max(1, cropH));
+
+      const manipStart = Date.now();
+      const result = await ImageManipulator.manipulateAsync(
+        uri,
+        [
+          {
+            crop: {
+              originX: safeOriginX,
+              originY: safeOriginY,
+              width: safeW,
+              height: safeH,
+            },
+          },
+          { resize: { width: GUIDE_BOX_SIZE, height: GUIDE_BOX_SIZE } },
+        ],
+        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
+      );
+      const manipMs = Date.now() - manipStart;
+      const totalMs = Date.now() - cropStart;
+
+      return result.uri ?? uri;
+    }
   } catch (err: any) {
     const totalMs = Date.now() - cropStart;
     clog("crop-512-error", { error: err?.message ?? String(err), totalMs });
