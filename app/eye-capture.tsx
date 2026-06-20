@@ -1,14 +1,13 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+// app/eye-capture.tsx
+import React, { useRef, useState, useCallback } from "react";
 import {
-  StyleSheet,
-  Text,
   View,
-  TouchableOpacity,
+  Text,
+  StyleSheet,
+  Dimensions,
   ActivityIndicator,
-  Platform,
-  ScrollView, // TEMP-ANDROID-DEBUG: used only by AndroidDebugPanel
 } from "react-native";
-import * as ImageManipulator from "expo-image-manipulator";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import {
   Camera,
   useCameraDevice,
@@ -18,1923 +17,564 @@ import {
 import { useTensorflowModel } from "react-native-fast-tflite";
 import { useResizePlugin } from "vision-camera-resize-plugin";
 import { Worklets } from "react-native-worklets-core";
-import { useSharedValue } from "react-native-reanimated";
-import Svg, { Path, Circle, Line } from "react-native-svg";
-import * as Speech from "expo-speech";
+import * as ImageManipulator from "expo-image-manipulator";
 
-import { useRouter, useLocalSearchParams } from "expo-router";
+// ─── Constants ─────────────────────────────────────────────
+const MODEL_SIZE = 320;
+const NUM_DETECTIONS = 300;
+const VALS_PER_BOX = 6;
+const CONF_THRESHOLD = 0.25;
+const FRAMES_NEEDED = 4;
+const OUTPUT_SIZE = 512;
 
-// ─────────────────────────────────────────────────────────────────
-//  MODEL CONFIG
-// ─────────────────────────────────────────────────────────────────
-const MODEL_INPUT_SIZE  = 320;
-const GUIDE_BOX_SIZE    = 512;
-const GUIDE_SCREEN_SIZE = 220;
-const NUM_DETECTIONS    = 300;
-const VALS_PER_BOX      = 6;
-const CONF_THRESHOLD    = 0.25;
+const { width: SW, height: SH } = Dimensions.get("window");
+const GUIDE_SIZE = 220;
+const GUIDE_LEFT = (SW - GUIDE_SIZE) / 2;
+const GUIDE_TOP = SH * 0.35;
+const GUIDE_RIGHT = GUIDE_LEFT + GUIDE_SIZE;
+const GUIDE_BOTTOM = GUIDE_TOP + GUIDE_SIZE;
+const GUIDE_INNER_MARGIN = GUIDE_SIZE * 0.1;
 
-const BBOX_MARGIN         = 20;
-const BBOX_MIN_AREA_RATIO = 0.01;
-const BBOX_MAX_AREA_RATIO = 0.25;
-const BBOX_DEBUG_LOG      = true;
-const BEST_OF_FRAMES      = 4;
-
-// ─────────────────────────────────────────────────────────────────
-//  ROTATION / MIRROR CONFIG
-// ─────────────────────────────────────────────────────────────────
-type RotationDeg = "0deg" | "90deg" | "180deg" | "270deg";
-
-const ROTATION_CONFIG: Record<
-  "ios" | "android",
-  { front: RotationDeg; back: RotationDeg }
-> = {
-  ios:     { front: "90deg",  back: "90deg"  },
-  android: { front: "270deg", back: "90deg"  },
+type DebugEyeBox = {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  score: number;
+  insideGuide: boolean;
 };
 
-const MIRROR_CONFIG: Record<
-  "ios" | "android",
-  { front: boolean; back: boolean }
-> = {
-  ios:     { front: true,  back: false },
-  android: { front: false, back: false },
-};
+function normalizeModelCoordinate(value: number) {
+  "worklet";
 
-const PLATFORM_KEY: "ios" | "android" =
-  Platform.OS === "android" ? "android" : "ios";
-
-// ─────────────────────────────────────────────────────────────────
-//  QUALITY THRESHOLDS
-// ─────────────────────────────────────────────────────────────────
-const BLUR_THRESHOLD     = 30;
-const BRIGHTNESS_LOW     = 65;
-const BRIGHTNESS_HIGH    = 205;
-const CCT_WARM_THRESHOLD = 3900;
-const CCT_WARM_BIAS      = 1.0;
-const Q_STEP             = 4;
-
-// ─────────────────────────────────────────────────────────────────
-//  TYPES
-// ─────────────────────────────────────────────────────────────────
-type Lang        = "en" | "hi" | "te";
-type LightStatus = "good" | "low" | "high";
-type BlurStatus  = "good" | "blurry";
-type TempStatus  = "good" | "warm";
-
-interface QualityState {
-  blurScore:   number;
-  blurStatus:  BlurStatus;
-  brightness:  number;
-  lightStatus: LightStatus;
-  cct:         number;
-  tempStatus:  TempStatus;
+  return value > 1 ? value / MODEL_SIZE : value;
 }
 
-interface DetectedBox {
-  x1: number;
-  y1: number;
-  x2: number;
-  y2: number;
-  score:     number;
-  type:      "full" | "partial";
-  valid:     boolean;
-  areaRatio: number;
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  FRAME DIMS REF
-// ─────────────────────────────────────────────────────────────────
-interface FrameDims {
-  rawW:     number;
-  rawH:     number;
-  rotation: RotationDeg;
-  mirror:   boolean;
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  PERF TRACKER
-// ─────────────────────────────────────────────────────────────────
-const perfHistory = {
-  resize:  [] as number[],
-  quality: [] as number[],
-  infer:   [] as number[],
-  detect:  [] as number[],
-  total:   [] as number[],
-  maxLen:  60,
-};
-
-function trackPerf(key: keyof Omit<typeof perfHistory, "maxLen">, ms: number) {
-  const arr = perfHistory[key];
-  arr.push(ms);
-  if (arr.length > perfHistory.maxLen) arr.shift();
-}
-
-function avgPerf(key: keyof Omit<typeof perfHistory, "maxLen">) {
-  const arr = perfHistory[key];
-  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
-}
-
-function p95Perf(key: keyof Omit<typeof perfHistory, "maxLen">) {
-  const arr = [...perfHistory[key]].sort((a, b) => a - b);
-  if (!arr.length) return 0;
-  return arr[Math.floor(arr.length * 0.95)] ?? arr[arr.length - 1];
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  STRUCTURED LOGGER  (original scope names kept exactly)
-// ─────────────────────────────────────────────────────────────────
-type LogScope =
-  | "app-init"
-  | "camera-init"
-  | "camera-switch"
-  | "camera-initialized"
-  | "camera-error"
-  | "camera-flip"
-  | "model-state"
-  | "permission"
-  | "frame-perf"
-  | "frame-perf-summary"
-  | "resize"
-  | "resize-diagnostic"
-  | "quality-metrics"
-  | "quality-change"
-  | "bbox"
-  | "detection-summary"
-  | "eye-confirmed"
-  | "voice-guidance"
-  | "frame-selected"       // NEW: worklet signalled JS with confirmed frame number
-  | "frame-exported"       // NEW: takeSnapshot() returned URI
-  | "auto-capture-trigger"
-  | "capture-start"
-  | "capture-photo-done"
-  | "capture-crop-start"
-  | "crop-512-input"
-  | "crop-512-clamped"
-  | "crop-512-done"
-  | "crop-512-error"
-  | "capture-complete"
-  | "capture-error"
-  | "capture-aborted"
-  | "lang-change"
-  | "session-info"
-  | "form-page-image"; // TEMP-ANDROID-DEBUG: logged right before router.replace()
-
-function clog(scope: LogScope, data: Record<string, unknown>) {
-  console.log(JSON.stringify({ ts: Date.now(), scope, ...data }));
-  // eslint-disable-next-line @typescript-eslint/no-use-before-define
-  debugEmit(scope, data); // TEMP-ANDROID-DEBUG: forwards to on-screen panel, no-op if disabled
-}
-
-// ╔═══════════════════════════════════════════════════════════════╗
-// ║  TEMP-ANDROID-DEBUG  — START                                   ║
-// ║  On-screen debug panel for Android devices that can't be       ║
-// ║  connected via ADB/USB. Shows capture pipeline info directly   ║
-// ║  on the phone screen. Does NOT touch detection, cropping,      ║
-// ║  quality, or navigation logic — purely additive/read-only.     ║
-// ║                                                                 ║
-// ║  TO REMOVE: delete every block delimited by                    ║
-// ║  "TEMP-ANDROID-DEBUG" comments (search the file for that       ║
-// ║  string), then remove the <AndroidDebugPanel .../> usage in    ║
-// ║  the JSX return, and the "form-page-image" line above.         ║
-// ╚═══════════════════════════════════════════════════════════════╝
-
-// Flip to false (or delete this whole block) to fully disable.
-const DEBUG_MODE_ANDROID = true;
-
-const DEBUG_SCOPES = new Set<LogScope>([
-  "frame-selected",
-  "capture-start",
-  "frame-exported",
-  "capture-crop-start",
-  "crop-512-input",
-  "crop-512-done",
-  "capture-complete",
-  "capture-error",
-  "form-page-image",
-]);
-
-interface DebugEvent {
-  id: number;
-  scope: LogScope;
-  data: Record<string, unknown>;
-  ts: number;
-}
-
-let debugEventSeq = 0;
-type DebugListener = (evt: DebugEvent) => void;
-let debugListeners: DebugListener[] = [];
-
-function debugEmit(scope: LogScope, data: Record<string, unknown>) {
-  if (!DEBUG_MODE_ANDROID || Platform.OS !== "android") return;
-  if (!DEBUG_SCOPES.has(scope)) return;
-  const evt: DebugEvent = { id: ++debugEventSeq, scope, data, ts: Date.now() };
-  debugListeners.forEach((l) => l(evt));
-}
-
-function debugSubscribe(listener: DebugListener) {
-  debugListeners.push(listener);
-  return () => {
-    debugListeners = debugListeners.filter((l) => l !== listener);
-  };
-}
-// ╔═══════════════════════════════════════════════════════════════╗
-// ║  TEMP-ANDROID-DEBUG  — END (bus/types — more blocks below)     ║
-// ╚═══════════════════════════════════════════════════════════════╝
-
-// ─────────────────────────────────────────────────────────────────
-//  ICONS
-// ─────────────────────────────────────────────────────────────────
-const IconEye = ({ size = 24, color = "#fff" }) => (
-  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-    <Path
-      d="M1 12C1 12 5 5 12 5C19 5 23 12 23 12C23 12 19 19 12 19C5 19 1 12 1 12Z"
-      stroke={color} strokeWidth="2" strokeLinejoin="round"
-    />
-    <Circle cx="12" cy="12" r="3.5" stroke={color} strokeWidth="2" />
-  </Svg>
-);
-
-const IconLight = ({ size = 24, color = "#fff" }) => (
-  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-    <Circle cx="12" cy="12" r="4" stroke={color} strokeWidth="2" />
-    <Line x1="12" y1="2"    x2="12" y2="5"    stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="12" y1="19"   x2="12" y2="22"   stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="2"  y1="12"   x2="5"  y2="12"   stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="19" y1="12"   x2="22" y2="12"   stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="4.93"  y1="4.93"  x2="7.05"  y2="7.05"  stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="16.95" y1="16.95" x2="19.07" y2="19.07" stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="19.07" y1="4.93"  x2="16.95" y2="7.05"  stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Line x1="7.05"  y1="16.95" x2="4.93"  y2="19.07" stroke={color} strokeWidth="2" strokeLinecap="round" />
-  </Svg>
-);
-
-const IconBlur = ({ size = 24, color = "#fff" }) => (
-  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-    <Circle cx="12" cy="12" r="10" stroke={color} strokeWidth="2" />
-    <Path d="M12 2C12 2 15 7 14 12C13 17 12 22 12 22" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
-    <Path d="M2 12C2 12 7 9 12 10C17 11 22 12 22 12" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
-  </Svg>
-);
-
-const IconSpeaker = ({ size = 22, color = "#fff" }) => (
-  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-    <Path d="M11 5L6 9H3C2.45 9 2 9.45 2 10V14C2 14.55 2.45 15 3 15H6L11 19V5Z" stroke={color} strokeWidth="2" strokeLinejoin="round" />
-    <Path d="M15.54 8.46C16.48 9.4 17 10.67 17 12C17 13.33 16.48 14.6 15.54 15.54" stroke={color} strokeWidth="2" strokeLinecap="round" />
-    <Path d="M19.07 4.93C20.96 6.82 22 9.35 22 12C22 14.65 20.96 17.18 19.07 19.07" stroke={color} strokeWidth="2" strokeLinecap="round" />
-  </Svg>
-);
-
-const IconFlip = ({ size = 18, color = "#fff" }) => (
-  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
-    <Path d="M20 7H4C2.9 7 2 7.9 2 9V18C2 19.1 2.9 20 4 20H20C21.1 20 22 19.1 22 18V9C22 7.9 21.1 7 20 7Z" stroke={color} strokeWidth="2" strokeLinejoin="round" />
-    <Circle cx="12" cy="13.5" r="3.5" stroke={color} strokeWidth="2" />
-    <Path d="M9 4L12 1L15 4" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-  </Svg>
-);
-
-// ─────────────────────────────────────────────────────────────────
-//  VOICE GUIDANCE
-// ─────────────────────────────────────────────────────────────────
-const VOICE: Record<string, Record<Lang, { text: string; bcp47: string }>> = {
-  alignFace: {
-    en: { text: "Pull down your lower eyelid and fill the box with the pink area.", bcp47: "en-IN" },
-    hi: { text: "निचली पलक को नीचे खींचें और गुलाबी हिस्से से बॉक्स भरें।", bcp47: "hi-IN" },
-    te: { text: "కింది రెప్పను కిందకు లాగి, గులాబీ భాగంతో బాక్స్ నింపండి.", bcp47: "te-IN" },
-  },
-  lowLight: {
-    en: { text: "Move to a brighter place.", bcp47: "en-IN" },
-    hi: { text: "रोशनी वाली जगह पर जाएं।", bcp47: "hi-IN" },
-    te: { text: "వెలుతురు ఉన్న చోటికి వెళ్ళండి.", bcp47: "te-IN" },
-  },
-  highLight: {
-    en: { text: "Too much light. Move away from window.", bcp47: "en-IN" },
-    hi: { text: "बहुत रोशनी है। खिड़की से दूर जाएं।", bcp47: "hi-IN" },
-    te: { text: "చాలా వెలుతురు. కిటికీ నుండి దూరంగా వెళ్ళండి.", bcp47: "te-IN" },
-  },
-  holdStill: {
-    en: { text: "Hold your phone steady.", bcp47: "en-IN" },
-    hi: { text: "फोन को स्थिर रखें।", bcp47: "hi-IN" },
-    te: { text: "ఫోన్‌ను స్థిరంగా పట్టుకోండి.", bcp47: "te-IN" },
-  },
-  warmLight: {
-    en: { text: "Avoid yellow light. Use neutral white light for better result.", bcp47: "en-IN" },
-    hi: { text: "पीली रोशनी से बचें। बेहतर परिणाम के लिए सफेद रोशनी का उपयोग करें।", bcp47: "hi-IN" },
-    te: { text: "పసుపు వెలుతురు నుండి దూరంగా ఉండండి. మంచి ఫలితం కోసం తెల్లటి వెలుతురు ఉపయోగించండి.", bcp47: "te-IN" },
-  },
-  allGood: {
-    en: { text: "Good! Capturing now.", bcp47: "en-IN" },
-    hi: { text: "बढ़िया! अभी कैप्चर हो रहा है।", bcp47: "hi-IN" },
-    te: { text: "బాగుంది! ఇప్పుడు క్యాప్చర్ అవుతోంది.", bcp47: "te-IN" },
-  },
-};
-
-function getProblemKey(
-  eyeConfirmed: boolean,
-  lightStatus:  string,
-  blurStatus:   string,
-  tempStatus:   string,
-): string {
-  if (!eyeConfirmed)           return "alignFace";
-  if (lightStatus === "low")   return "lowLight";
-  if (lightStatus === "high")  return "highLight";
-  if (tempStatus  === "warm")  return "warmLight";
-  if (blurStatus  === "blurry") return "holdStill";
-  return "allGood";
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  BBOX VALIDATION
-// ─────────────────────────────────────────────────────────────────
-function validateBBox(
-  nx1: number, ny1: number, nx2: number, ny2: number,
-  imgW: number, imgH: number,
+function getEyeBoxOnScreen(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
 ) {
   "worklet";
 
-  const x1 = Math.round(nx1 * imgW);
-  const y1 = Math.round(ny1 * imgH);
-  const x2 = Math.round(nx2 * imgW);
-  const y2 = Math.round(ny2 * imgH);
-
-  const touchesLeft   = x1 <= BBOX_MARGIN;
-  const touchesTop    = y1 <= BBOX_MARGIN;
-  const touchesRight  = x2 >= imgW - BBOX_MARGIN;
-  const touchesBottom = y2 >= imgH - BBOX_MARGIN;
-
-  const isPartial = touchesLeft || touchesTop || touchesRight || touchesBottom;
-
-  if (isPartial) {
-    return {
-      valid: 0 as const, type: "partial" as const,
-      area: 0, areaRatio: 0, x1, y1, x2, y2,
-      reason: "touching border",
-    };
-  }
-
-  const width     = x2 - x1;
-  const height    = y2 - y1;
-  const area      = width * height;
-  const areaRatio = area / (imgW * imgH);
-  const areaOk    = areaRatio >= BBOX_MIN_AREA_RATIO && areaRatio <= BBOX_MAX_AREA_RATIO;
+  const left = normalizeModelCoordinate(Math.min(x1, x2)) * SW;
+  const top = normalizeModelCoordinate(Math.min(y1, y2)) * SH;
+  const right = normalizeModelCoordinate(Math.max(x1, x2)) * SW;
+  const bottom = normalizeModelCoordinate(Math.max(y1, y2)) * SH;
 
   return {
-    valid: (areaOk ? 1 : 0) as 0 | 1,
-    type: "full" as const,
-    area, areaRatio, x1, y1, x2, y2,
-    reason: areaOk ? "ok" : "area out of range",
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
   };
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  SHARED CROP GEOMETRY  (used by BOTH Android and iOS)
-//
-//  Both platforms crop the SAME conceptual region: a
-//  GUIDE_BOX_SIZE x GUIDE_BOX_SIZE square, centered, expressed in the
-//  camera's own LOGICAL (orientation-corrected) frame pixel space —
-//  then scaled per-axis into the actual captured photo's pixel space.
-//
-//  GUIDE_BOX_SIZE (512) is the correct reference constant: it's the
-//  value shown in the on-screen "512 × 512" label, and the final
-//  output resize target on both platforms.
-//
-//  GUIDE_SCREEN_SIZE (220) is a UI-ONLY dp constant used purely to
-//  size the dashed guide box <View> rendered on screen. It must NEVER
-//  be used in pixel-space crop math — that was the bug: Android used
-//  to compute `cropSize = GUIDE_SCREEN_SIZE * scale`, which produced
-//  a crop region roughly 43% the size it should have been (~248px
-//  instead of ~577px before the final 512x512 resize), i.e. a visibly
-//  more "zoomed in" crop than what the user actually saw in the guide
-//  box on screen. iOS already used GUIDE_BOX_SIZE correctly; this
-//  function is the same formula iOS used, now shared by both
-//  platforms so they can never drift apart again.
-// ─────────────────────────────────────────────────────────────────
-function computeGuideCropRegion(
-  imgW: number, imgH: number,
-  rawW: number, rawH: number,
-  rotation: RotationDeg,
+function checkEyeWithinGuideBox(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
 ) {
-  const is90or270 = rotation === "90deg" || rotation === "270deg";
-  const logicalW  = is90or270 ? rawH : rawW;
-  const logicalH  = is90or270 ? rawW : rawH;
+  "worklet";
 
-  // Scale from the camera's logical (orientation-corrected) frame pixel
-  // space into the actual captured photo's pixel space, per axis.
-  const scaleX = imgW / logicalW;
-  const scaleY = imgH / logicalH;
-  const half   = GUIDE_BOX_SIZE / 2;
-
-  const originX = Math.round((logicalW / 2 - half) * scaleX);
-  const originY = Math.round((logicalH / 2 - half) * scaleY);
-  const cropW   = Math.round(GUIDE_BOX_SIZE * scaleX);
-  const cropH   = Math.round(GUIDE_BOX_SIZE * scaleY);
-
-  // Clamp to photo bounds so ImageManipulator never receives an
-  // out-of-range crop rect.
-  const safeOriginX = Math.max(0, Math.min(imgW - 1, originX));
-  const safeOriginY = Math.max(0, Math.min(imgH - 1, originY));
-  const safeW       = Math.min(imgW - safeOriginX, Math.max(1, cropW));
-  const safeH       = Math.min(imgH - safeOriginY, Math.max(1, cropH));
-
-  return {
-    logicalW, logicalH, scaleX, scaleY,
-    originX, originY, cropW, cropH,
-    safeOriginX, safeOriginY, safeW, safeH,
-  };
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  CROP UTILITY
-//
-//  iOS:
-//    takeSnapshot() returns photo already in LOGICAL orientation
-//    (EXIF applied by OS). Scale center crop from logical frame
-//    coords → photo pixel coords directly.
-//
-//  Android:
-//    takeSnapshot() on Android also returns the preview buffer
-//    which is in the same RAW SENSOR orientation as takePhoto().
-//    rotation/logicalW/logicalH handling (above, shared) maps that
-//    raw-sensor-orientation buffer back into photo pixel space.
-//
-//  Both platforms now run through the SAME geometry function
-//  (computeGuideCropRegion) using GUIDE_BOX_SIZE as the reference —
-//  the only per-platform differences left are which raw-buffer
-//  orientation quirk required the rotation handling in the first
-//  place, and Android's extra structured debug logging.
-// ─────────────────────────────────────────────────────────────────
-async function cropGuideBoxTo512(uri: string, dims: FrameDims): Promise<string> {
-  const cropStart = Date.now();
-  const { rawW, rawH, rotation } = dims;
-
-  clog("capture-crop-start", {
-    uri,
-    rawW,
-    rawH,
-    rotation,
-    platform: Platform.OS,
-  });
-
-  try {
-    const { width: imgW, height: imgH } = await new Promise<{
-      width: number; height: number;
-    }>((resolve, reject) =>
-      require("react-native").Image.getSize(
-        uri,
-        (w: number, h: number) => resolve({ width: w, height: h }),
-        reject,
-      ),
-    );
-
-    const geo = computeGuideCropRegion(imgW, imgH, rawW, rawH, rotation);
-
-    if (Platform.OS === "android") {
-      clog("crop-512-input", {
-        platform: Platform.OS,
-        rawW, rawH, rotation,
-        logicalW: geo.logicalW, logicalH: geo.logicalH,
-        imgW, imgH,
-        scaleX: +geo.scaleX.toFixed(3),
-        scaleY: +geo.scaleY.toFixed(3),
-        originX: geo.originX, originY: geo.originY,
-        cropW: geo.cropW, cropH: geo.cropH,
-      });
-
-      const manipStart = Date.now();
-      const result = await ImageManipulator.manipulateAsync(
-        uri,
-        [
-          {
-            crop: {
-              originX: geo.safeOriginX,
-              originY: geo.safeOriginY,
-              width:   geo.safeW,
-              height:  geo.safeH,
-            },
-          },
-          { resize: { width: GUIDE_BOX_SIZE, height: GUIDE_BOX_SIZE } },
-        ],
-        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
-      );
-      const manipMs = Date.now() - manipStart;
-      const totalMs = Date.now() - cropStart;
-
-      clog("crop-512-done", {
-        platform:     Platform.OS,
-        outputUri:    result.uri,
-        outputWidth:  result.width,
-        outputHeight: result.height,
-        outputSize:   `${result.width}x${result.height}`,
-        manipMs,
-        totalCropMs: totalMs,
-      });
-
-      return result.uri ?? uri;
-
-    } else {
-      // iOS — same geometry, photo is already in logical orientation
-      // (EXIF applied by OS) so logicalW/logicalH map directly.
-      const manipStart = Date.now();
-      const result = await ImageManipulator.manipulateAsync(
-        uri,
-        [
-          {
-            crop: {
-              originX: geo.safeOriginX,
-              originY: geo.safeOriginY,
-              width:   geo.safeW,
-              height:  geo.safeH,
-            },
-          },
-          { resize: { width: GUIDE_BOX_SIZE, height: GUIDE_BOX_SIZE } },
-        ],
-        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
-      );
-      const manipMs = Date.now() - manipStart;
-      const totalMs = Date.now() - cropStart;
-
-      clog("crop-512-done", {
-        platform:     Platform.OS,
-        outputUri:    result.uri,
-        outputWidth:  result.width,
-        outputHeight: result.height,
-        outputSize:   `${result.width}x${result.height}`,
-        manipMs,
-        totalCropMs: totalMs,
-      });
-
-      return result.uri ?? uri;
-    }
-  } catch (err: any) {
-    const totalMs = Date.now() - cropStart;
-    clog("crop-512-error", { error: err?.message ?? String(err), totalMs });
-    return uri;
-  }
-}
-
-// ╔═══════════════════════════════════════════════════════════════╗
-// ║  TEMP-ANDROID-DEBUG  — START (UI panel)                        ║
-// ║  Self-contained component + styles. Reads only from the        ║
-// ║  debug event bus above; never calls into capture/crop/nav      ║
-// ║  logic. Delete this whole block + its usage in the JSX to      ║
-// ║  remove debug mode entirely.                                   ║
-// ╚═══════════════════════════════════════════════════════════════╝
-function formatDebugVal(v: unknown): string {
-  if (v === undefined || v === null) return "—";
-  if (typeof v === "number") return String(v);
-  if (typeof v === "string") return v;
-  return JSON.stringify(v);
-}
-
-function AndroidDebugPanel({ events }: { events: DebugEvent[] }) {
-  const [expanded, setExpanded] = useState(true);
-  const [showRaw, setShowRaw]   = useState(false);
-  const [events_, setEventsLocal] = useState<DebugEvent[]>(events);
-
-  // Keep an internal copy so "Clear" doesn't depend on parent re-render timing.
-  useEffect(() => setEventsLocal(events), [events]);
-
-  const summary = (() => {
-    const sum: Record<string, unknown> = {};
-    for (const e of events_) {
-      const d = e.data;
-      switch (e.scope) {
-        case "frame-selected":
-          sum.frameSelected  = d.frame;
-          sum.confirmedFrame = d.frame;
-          sum.eyeSide        = d.eyeSide;
-          break;
-        case "capture-start":
-          sum.rotation = d.rotation;
-          sum.mirror   = d.mirror;
-          sum.rawW     = d.rawW;
-          sum.rawH     = d.rawH;
-          sum.trigger  = d.trigger ?? "auto";
-          sum.eyeSide  = d.eyeSide;
-          if (d.frame !== undefined) {
-            sum.frameSelected  = d.frame;
-            sum.confirmedFrame = d.frame;
-          }
-          break;
-        case "frame-exported":
-          sum.imageWidth  = d.snapshotWidth;
-          sum.imageHeight = d.snapshotHeight;
-          sum.rawUri      = d.uri;
-          break;
-        case "crop-512-input":
-          sum.cropOriginX = d.originX;
-          sum.cropOriginY = d.originY;
-          sum.cropWidth   = d.cropW;
-          sum.cropHeight  = d.cropH;
-          break;
-        case "crop-512-done":
-          sum.outputSize = d.outputSize;
-          sum.outputUri  = d.outputUri;
-          break;
-        case "capture-complete":
-          sum.croppedUri = d.croppedUri;
-          sum.totalMs    = d.totalMs;
-          break;
-        case "form-page-image":
-          sum.finalUri = d.croppedUri;
-          sum.eyeSide  = d.eyeSide;
-          break;
-        case "capture-error":
-          sum.error = d.error;
-          break;
-      }
-    }
-    return sum;
-  })();
-
-  const hasData = events_.length > 0;
+  const box = getEyeBoxOnScreen(x1, y1, x2, y2);
+  const innerLeft = GUIDE_LEFT + GUIDE_INNER_MARGIN;
+  const innerTop = GUIDE_TOP + GUIDE_INNER_MARGIN;
+  const innerRight = GUIDE_RIGHT - GUIDE_INNER_MARGIN;
+  const innerBottom = GUIDE_BOTTOM - GUIDE_INNER_MARGIN;
 
   return (
-    <View pointerEvents="box-none" style={ds.wrap}>
-      <TouchableOpacity style={ds.header} onPress={() => setExpanded((v) => !v)} activeOpacity={0.8}>
-        <Text style={ds.headerText}>🐞 ANDROID DEBUG {hasData ? `(${events_.length})` : ""}</Text>
-        <Text style={ds.headerToggle}>{expanded ? "▾" : "▸"}</Text>
-      </TouchableOpacity>
-
-      {expanded && (
-        <View style={ds.body}>
-          {!hasData ? (
-            <Text style={ds.muted}>Waiting for a capture…</Text>
-          ) : (
-            <>
-              <Text style={ds.summaryLine}>
-                Frame Selected: {formatDebugVal(summary.frameSelected)}  Confirmed Frame: {formatDebugVal(summary.confirmedFrame)}
-              </Text>
-              <Text style={ds.summaryLine}>
-                Eye Side: {formatDebugVal(summary.eyeSide)}{summary.trigger ? `  (${formatDebugVal(summary.trigger)})` : ""}
-              </Text>
-              <Text style={ds.summaryLine}>
-                Image: {formatDebugVal(summary.imageWidth)} x {formatDebugVal(summary.imageHeight)}
-              </Text>
-              <Text style={ds.summaryLine}>
-                Crop: originX={formatDebugVal(summary.cropOriginX)} originY={formatDebugVal(summary.cropOriginY)} width={formatDebugVal(summary.cropWidth)} height={formatDebugVal(summary.cropHeight)}
-              </Text>
-              <Text style={ds.summaryLine}>
-                Rotation={formatDebugVal(summary.rotation)} Mirror={formatDebugVal(summary.mirror)}
-              </Text>
-              <Text style={ds.summaryLine}>
-                Output: {formatDebugVal(summary.outputSize)}{summary.totalMs ? `  (${formatDebugVal(summary.totalMs)}ms total)` : ""}
-              </Text>
-              {summary.error !== undefined && (
-                <Text style={[ds.summaryLine, ds.errorLine]}>Error: {formatDebugVal(summary.error)}</Text>
-              )}
-              <Text style={[ds.summaryLine, ds.uriLine]} numberOfLines={2}>
-                URI: {formatDebugVal(summary.finalUri ?? summary.croppedUri ?? summary.outputUri)}
-              </Text>
-
-              <View style={ds.row}>
-                <TouchableOpacity style={ds.smallBtn} onPress={() => setShowRaw((v) => !v)}>
-                  <Text style={ds.smallBtnText}>{showRaw ? "Hide" : "Show"} raw events</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={ds.smallBtn}
-                  onPress={() => { setEventsLocal([]); debugEventSeq = 0; }}
-                >
-                  <Text style={ds.smallBtnText}>Clear</Text>
-                </TouchableOpacity>
-              </View>
-
-              {showRaw && (
-                <ScrollView style={ds.rawList} nestedScrollEnabled>
-                  {[...events_].reverse().map((e) => (
-                    <Text key={e.id} style={ds.rawLine}>
-                      [{e.scope}] {formatDebugVal(e.data)}
-                    </Text>
-                  ))}
-                </ScrollView>
-              )}
-            </>
-          )}
-        </View>
-      )}
-    </View>
+    box.width > 0 &&
+    box.height > 0 &&
+    box.left >= innerLeft &&
+    box.top >= innerTop &&
+    box.right <= innerRight &&
+    box.bottom <= innerBottom
   );
 }
 
-const ds = StyleSheet.create({
-  wrap: {
-    position: "absolute",
-    top: 4,
-    right: 4,
-    maxWidth: 280,
-    zIndex: 999,
-    backgroundColor: "rgba(20,0,0,0.85)",
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#ff5252",
-  },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-  },
-  headerText:   { color: "#ff8a80", fontSize: 11, fontWeight: "800", fontFamily: "monospace" },
-  headerToggle: { color: "#ff8a80", fontSize: 12, marginLeft: 8 },
-  body: { paddingHorizontal: 10, paddingBottom: 10, gap: 3 },
-  muted: { color: "rgba(255,255,255,0.5)", fontSize: 11, fontFamily: "monospace" },
-  summaryLine: { color: "#fff", fontSize: 10.5, fontFamily: "monospace" },
-  errorLine: { color: "#ff5252" },
-  uriLine: { color: "rgba(255,255,255,0.6)", marginTop: 2 },
-  row: { flexDirection: "row", gap: 8, marginTop: 6 },
-  smallBtn: { backgroundColor: "rgba(255,255,255,0.12)", paddingVertical: 4, paddingHorizontal: 8, borderRadius: 6 },
-  smallBtnText: { color: "#fff", fontSize: 10, fontWeight: "600" },
-  rawList: { maxHeight: 160, marginTop: 6, borderTopWidth: 1, borderTopColor: "rgba(255,255,255,0.15)", paddingTop: 4 },
-  rawLine: { color: "rgba(255,255,255,0.55)", fontSize: 9, fontFamily: "monospace", marginBottom: 4 },
-} as any);
-// ╔═══════════════════════════════════════════════════════════════╗
-// ║  TEMP-ANDROID-DEBUG  — END (UI panel)                          ║
-// ╚═══════════════════════════════════════════════════════════════╝
-
-// ─────────────────────────────────────────────────────────────────
-//  COMPONENT
-// ─────────────────────────────────────────────────────────────────
 export default function EyeCaptureScreen() {
-  const router          = useRouter();
-  const sessionStartRef = useRef(Date.now());
-
+  const router = useRouter();
   const params = useLocalSearchParams<{
+    eyeSide?: "left" | "right";
     name?: string;
     parentName?: string;
     phoneNumber?: string;
     age?: string;
     gender?: string;
     eyeSessionId?: string;
-    leftEyeImage?: string;
-    rightEyeImage?: string;
-    eyeSide?: string;
   }>();
 
-  const eyeSide = (params.eyeSide ?? "left") as "left" | "right";
+  const { eyeSide = "right" } = params;
+
+  const cameraRef = useRef<Camera>(null);
 
   const { hasPermission, requestPermission } = useCameraPermission();
+  const device = useCameraDevice("front");
 
-  const [facing,       setFacing]       = useState<"front" | "back">("front");
-  const [eyeConfirmed, setEyeConfirmed] = useState(false);
-  const [debugInfo,    setDebugInfo]    = useState("Waiting...");
-  const [camReady,     setCamReady]     = useState(false);
-  const [lang,         setLang]         = useState<Lang>("en");
-  const [isSpeaking,   setIsSpeaking]   = useState(false);
-  const [capturing,    setCapturing]    = useState(false);
-  const [quality, setQuality] = useState<QualityState>({
-    blurScore: 0, blurStatus: "blurry", brightness: 0,
-    lightStatus: "low", cct: 5500, tempStatus: "good",
-  });
-  const [detectedBox, setDetectedBox] = useState<DetectedBox | null>(null);
-
-  // TEMP-ANDROID-DEBUG: holds events forwarded from clog() for on-screen display.
-  // No-op (stays empty, panel never renders) unless DEBUG_MODE_ANDROID is true
-  // and Platform.OS === 'android'. Safe to delete along with the rest of the
-  // TEMP-ANDROID-DEBUG blocks.
-  const [debugEvents, setDebugEvents] = useState<DebugEvent[]>([]);
-  useEffect(() => {
-    if (!DEBUG_MODE_ANDROID || Platform.OS !== "android") return;
-    const unsubscribe = debugSubscribe((evt) => {
-      setDebugEvents((prev) => {
-        const next = [...prev, evt];
-        return next.length > 50 ? next.slice(next.length - 50) : next;
-      });
-    });
-    return unsubscribe;
-  }, []);
-
-  const prevQualityRef  = useRef<QualityState | null>(null);
-  const prevProblemKey  = useRef<string | null>(null);
-  const frameDimsRef    = useRef<FrameDims>({
-    rawW: 1080, rawH: 1920,
-    rotation: ROTATION_CONFIG[PLATFORM_KEY]["front"],
-    mirror:   MIRROR_CONFIG[PLATFORM_KEY]["front"],
-  });
-  const lastSpokenKey   = useRef<string | null>(null);
-  const lastSpokenTime  = useRef<number>(0);
-  const cameraRef       = useRef<any>(null);
-  const hasFiredCapture = useRef(false);
-  const jsFrameCountRef = useRef(0);
-  const confirmedFrameRef = useRef<number | null>(null);
-  // Guard: prevents duplicate snapshot calls. Reset on camera switch.
-  const snapshotFiredRef = useRef(false);
-
-  const backDevice  = useCameraDevice("back");
-  const frontDevice = useCameraDevice("front");
-  const device      = facing === "back" ? backDevice : frontDevice;
-
-  const { model, state } = useTensorflowModel(
+  const { model, state: modelState } = useTensorflowModel(
     require("../assets/model/11-06-2026-yolo-26-n-best_float32.tflite"),
   );
   const { resize } = useResizePlugin();
 
-  const frameWindow    = useSharedValue<number[]>([]);
-  const frameCounter   = useSharedValue(0);
-  const isFrontCam     = useSharedValue(0);
-  const eyeConfirmedSV = useSharedValue(0);
+  const [detected, setDetected] = useState(false);
+  const [score, setScore] = useState(0);
+  const [frameCount, setFrameCount] = useState(0);
+  const [statusMsg, setStatusMsg] = useState("Position eye in the box");
+  const [capturing, setCapturing] = useState(false);
+  const [debugEyeBox, setDebugEyeBox] = useState<DebugEyeBox | null>(null);
 
-  // ── Startup log ───────────────────────────────────────────────
-  useEffect(() => {
-    clog("app-init", {
-      eyeSide,
-      platform:     Platform.OS,
-      defaultCam:   facing,
-      sessionId:    params.eyeSessionId ?? "none",
-      patient:      params.name         ?? "unknown",
-      age:          params.age          ?? "unknown",
-      gender:       params.gender       ?? "unknown",
-      modelInput:   MODEL_INPUT_SIZE,
-      guideBox:     GUIDE_BOX_SIZE,
-      confThresh:   CONF_THRESHOLD,
-      bestOf:       BEST_OF_FRAMES,
-      blurThresh:   BLUR_THRESHOLD,
-      briLow:       BRIGHTNESS_LOW,
-      briHigh:      BRIGHTNESS_HIGH,
-      cctWarm:      CCT_WARM_THRESHOLD,
-      rotationConfig: ROTATION_CONFIG[PLATFORM_KEY],
-      mirrorConfig:   MIRROR_CONFIG[PLATFORM_KEY],
-    });
-  }, []);
+  const cameraReadyRef = useRef(false);
+  const capturingRef = useRef(false);
+  const consecutiveRef = useRef(0);
 
-  useEffect(() => {
-    clog("model-state", { state, eyeSide });
-  }, [state]);
+  const setDetectedJS = Worklets.createRunOnJS(setDetected);
+  const setScoreJS = Worklets.createRunOnJS(setScore);
+  const setFrameCountJS = Worklets.createRunOnJS(setFrameCount);
+  const setStatusMsgJS = Worklets.createRunOnJS(setStatusMsg);
+  const setDebugEyeBoxJS = Worklets.createRunOnJS(setDebugEyeBox);
 
-  useEffect(() => {
-    if (!hasPermission) {
-      clog("permission", { status: "requesting" });
-      requestPermission().then((granted) => {
-        clog("permission", { status: granted ? "granted" : "denied" });
-      });
-    } else {
-      clog("permission", { status: "already-granted" });
-    }
-  }, [hasPermission]);
+  // ── Capture & Navigate ─────────────────
+  const captureAndNavigate = useCallback(async () => {
+    if (capturingRef.current) return;
 
-  useEffect(
-    () => () => {
-      const sessionMs = Date.now() - sessionStartRef.current;
-      clog("session-info", {
-        eyeSide,
-        totalSessionMs:  sessionMs,
-        totalFrames:     jsFrameCountRef.current,
-        confirmedAtFrame: confirmedFrameRef.current,
-        avgFps: jsFrameCountRef.current > 0
-          ? +(jsFrameCountRef.current / (sessionMs / 1000)).toFixed(1)
-          : 0,
-      });
-      Speech.stop();
-    },
-    [],
-  );
+    const camera = cameraRef.current;
 
-  useEffect(() => {
-    const camKey = facing === "front" ? "front" : "back";
-    isFrontCam.value         = facing === "front" ? 1 : 0;
-    frameWindow.value        = [];
-    frameCounter.value       = 0;
-    eyeConfirmedSV.value     = 0;
-    hasFiredCapture.current  = false;
-    snapshotFiredRef.current = false;  // reset guard on camera switch
-    jsFrameCountRef.current  = 0;
-    confirmedFrameRef.current = null;
-    setEyeConfirmed(false);
-    setCamReady(false);
-    setDetectedBox(null);
-    setDebugInfo(`Switching to ${facing}...`);
-
-    frameDimsRef.current = {
-      rawW: 1080, rawH: 1920,
-      rotation: ROTATION_CONFIG[PLATFORM_KEY][camKey],
-      mirror:   MIRROR_CONFIG[PLATFORM_KEY][camKey],
-    };
-
-    clog("camera-switch", {
-      to:     facing,
-      eyeSide,
-      device: facing === "back" ? backDevice?.id : frontDevice?.id,
-    });
-
-    const delay = facing === "back" ? 1400 : 800;
-    const t     = setTimeout(() => setCamReady(true), delay);
-    return () => clearTimeout(t);
-  }, [facing]);
-
-  // ── Worklet → JS bridges ──────────────────────────────────────
-  const setEyeConfirmedJS = Worklets.createRunOnJS(setEyeConfirmed);
-  const setDebugInfoJS    = Worklets.createRunOnJS(setDebugInfo);
-  const setQualityJS      = Worklets.createRunOnJS(setQuality);
-  const setDetectedBoxJS  = Worklets.createRunOnJS(setDetectedBox);
-
-  const setFrameDimsJS = Worklets.createRunOnJS(
-    (rawW: number, rawH: number, rotation: RotationDeg, mirror: boolean) => {
-      frameDimsRef.current = { rawW, rawH, rotation, mirror };
-    },
-  );
-
-  const trackPerfJS = Worklets.createRunOnJS(
-    (r: number, q: number, inf: number, det: number, tot: number) => {
-      trackPerf("resize",  r);
-      trackPerf("quality", q);
-      trackPerf("infer",   inf);
-      trackPerf("detect",  det);
-      trackPerf("total",   tot);
-      jsFrameCountRef.current += 1;
-    },
-  );
-
-  const logPerfSummaryJS = Worklets.createRunOnJS(
-    (frame: number, cam: string) => {
-      clog("frame-perf-summary", {
-        cam, frame,
-        totalFrames: jsFrameCountRef.current,
-        avg: {
-          resizeMs:  +avgPerf("resize").toFixed(1),
-          qualityMs: +avgPerf("quality").toFixed(1),
-          inferMs:   +avgPerf("infer").toFixed(1),
-          detectMs:  +avgPerf("detect").toFixed(1),
-          totalMs:   +avgPerf("total").toFixed(1),
-        },
-        p95: {
-          resizeMs:  +p95Perf("resize").toFixed(1),
-          qualityMs: +p95Perf("quality").toFixed(1),
-          inferMs:   +p95Perf("infer").toFixed(1),
-          detectMs:  +p95Perf("detect").toFixed(1),
-          totalMs:   +p95Perf("total").toFixed(1),
-        },
-        estFps: jsFrameCountRef.current > 0
-          ? +(1000 / (avgPerf("total") || 1)).toFixed(1)
-          : 0,
-      });
-    },
-  );
-
-  const logQualityChangeJS = Worklets.createRunOnJS(
-    (prev: QualityState | null, next: QualityState, frame: number, cam: string) => {
-      const changed =
-        !prev ||
-        prev.lightStatus !== next.lightStatus ||
-        prev.blurStatus  !== next.blurStatus  ||
-        prev.tempStatus  !== next.tempStatus;
-      if (changed) {
-        clog("quality-change", {
-          cam, frame,
-          from: prev
-            ? { light: prev.lightStatus, blur: prev.blurStatus, temp: prev.tempStatus }
-            : null,
-          to: { light: next.lightStatus, blur: next.blurStatus, temp: next.tempStatus },
-          metrics: {
-            brightness: +next.brightness.toFixed(1),
-            blurScore:  +next.blurScore.toFixed(1),
-            cct:        +next.cct.toFixed(0),
-          },
-        });
-        prevQualityRef.current = next;
-      }
-    },
-  );
-
-  // ─────────────────────────────────────────────────────────────
-  //  onFrameConfirmedJS
-  //
-  //  Called by the worklet the instant BEST_OF_FRAMES consecutive
-  //  valid detections complete (the 4th confirmed frame).
-  //
-  //  ONLY CHANGE from old code: takePhoto() → takeSnapshot()
-  //  takeSnapshot() reads the PREVIEW BUFFER (no sensor shutter)
-  //  so the exact 4th confirmed frame is captured.
-  //
-  //  cropGuideBoxTo512() now runs the SAME geometry on both
-  //  platforms (see computeGuideCropRegion above) — no changes to
-  //  detection / BEST_OF_FRAMES / confirmation / navigation here.
-  // ─────────────────────────────────────────────────────────────
-  const onFrameConfirmedJS = Worklets.createRunOnJS(
-    async (confirmedFrame: number, cam: string) => {
-      if (snapshotFiredRef.current) return;
-      snapshotFiredRef.current  = true;
-      hasFiredCapture.current   = true;
-      confirmedFrameRef.current = confirmedFrame;  // FIX: was never assigned
-
-      clog("frame-selected", {
-        frame:     confirmedFrame,
-        cam,
-        eyeSide,
-        sessionMs: Date.now() - sessionStartRef.current,
-      });
-
-      if (!cameraRef.current) {
-        clog("capture-error", {
-          eyeSide, error: "no-camera-ref", frame: confirmedFrame,
-        });
-        snapshotFiredRef.current = false;
-        return;
-      }
-
-      setCapturing(true);
-      Speech.stop();
-
-      const captureStart = Date.now();
-      const currentDims  = frameDimsRef.current;
-
-      clog("capture-start", {
-        eyeSide, facing,
-        frame:    confirmedFrame,
-        rawW:     currentDims.rawW,
-        rawH:     currentDims.rawH,
-        rotation: currentDims.rotation,
-        mirror:   currentDims.mirror,
-        sessionMs: captureStart - sessionStartRef.current,
-      });
-
-      try {
-        // ── ONLY CHANGE: takePhoto() → takeSnapshot() ─────────────
-        // takeSnapshot() reads the current preview buffer.
-        // No sensor shutter is fired. The exact confirmed frame
-        // is captured instead of a future frame.
-        // skipMetadata: false keeps EXIF so ImageManipulator
-        // reads orientation correctly on both platforms.
-        const photoStart = Date.now();
-        const snapshot = await cameraRef.current.takeSnapshot({
-          quality:       92,
-          skipMetadata:  false,
-        });
-        const photoMs = Date.now() - photoStart;
-
-        const uri = Platform.OS === "android"
-          ? `file://${snapshot.path}`
-          : snapshot.path;
-
-        clog("frame-exported", {
-          frame:         confirmedFrame,
-          cam,
-          eyeSide,
-          uri,
-          snapshotWidth:  snapshot.width,
-          snapshotHeight: snapshot.height,
-          photoMs,
-          rawW:     currentDims.rawW,
-          rawH:     currentDims.rawH,
-          rotation: currentDims.rotation,
-        });
-
-        // ── Crop logic — same geometry on Android + iOS ───────────
-        const croppedUri = await cropGuideBoxTo512(uri, currentDims);
-        // ─────────────────────────────────────────────────────────
-
-        const totalMs = Date.now() - captureStart;
-        clog("capture-complete", {
-          eyeSide,
-          totalMs,
-          photoMs,
-          croppedUri,
-          sessionMs:   Date.now() - sessionStartRef.current,
-          totalFrames: jsFrameCountRef.current,
-          avgInferMs:  +avgPerf("infer").toFixed(1),
-          avgTotalMs:  +avgPerf("total").toFixed(1),
-          p95InferMs:  +p95Perf("infer").toFixed(1),
-          p95TotalMs:  +p95Perf("total").toFixed(1),
-        });
-
-        // TEMP-ANDROID-DEBUG: additive log only, does not alter navigation
-        clog("form-page-image", {
-          eyeSide,
-          croppedUri,
-          navigatingTo: "/",
-        });
-
-        router.replace({
-          pathname: "/",
-          params: {
-            name:         params.name         ?? "",
-            parentName:   params.parentName   ?? "",
-            phoneNumber:  params.phoneNumber  ?? "",
-            age:          params.age          ?? "",
-            gender:       params.gender       ?? "",
-            eyeSessionId: params.eyeSessionId ?? "",
-            leftEyeImage:
-              eyeSide === "left"  ? croppedUri : (params.leftEyeImage  ?? ""),
-            rightEyeImage:
-              eyeSide === "right" ? croppedUri : (params.rightEyeImage ?? ""),
-          },
-        });
-      } catch (err: any) {
-        const totalMs = Date.now() - captureStart;
-        clog("capture-error", {
-          eyeSide, error: err?.message ?? String(err), totalMs,
-        });
-        snapshotFiredRef.current = false;
-        hasFiredCapture.current  = false;
-      } finally {
-        setCapturing(false);
-      }
-    },
-  );
-
-  const speakNow = useCallback(
-    (key: string, l: Lang = lang) => {
-      const entry = VOICE[key]?.[l];
-      if (!entry) return;
-      const now = Date.now();
-      clog("voice-guidance", {
-        key, lang: l, text: entry.text, bcp47: entry.bcp47, triggerTs: now,
-      });
-      Speech.stop();
-      setIsSpeaking(true);
-      Speech.speak(entry.text, {
-        language: entry.bcp47, rate: 1.0, pitch: 1.0,
-        onDone:  () => setIsSpeaking(false),
-        onError: () => setIsSpeaking(false),
-      });
-    },
-    [lang],
-  );
-
-  const qualityGood =
-    quality.blurStatus  === "good" &&
-    quality.lightStatus === "good" &&
-    quality.tempStatus  === "good";
-
-  const allGood    = eyeConfirmed && qualityGood;
-  const problemKey = getProblemKey(
-    eyeConfirmed, quality.lightStatus, quality.blurStatus, quality.tempStatus,
-  );
-
-  useEffect(() => {
-    if (problemKey !== prevProblemKey.current) {
-      clog("voice-guidance", {
-        event: "key-change",
-        from:  prevProblemKey.current,
-        to:    problemKey,
-        frame: jsFrameCountRef.current,
-        eyeSide,
-      });
-      prevProblemKey.current = problemKey;
-    }
-  }, [problemKey]);
-
-  useEffect(() => {
-    const now = Date.now();
-    if (
-      problemKey !== lastSpokenKey.current ||
-      now - lastSpokenTime.current > 8000
-    ) {
-      lastSpokenKey.current  = problemKey;
-      lastSpokenTime.current = now;
-      speakNow(problemKey, lang);
-    }
-  }, [problemKey, lang, speakNow]);
-
-  const handleLangChange = useCallback(
-    (l: Lang) => {
-      clog("lang-change", { from: lang, to: l, frame: jsFrameCountRef.current });
-      setLang(l);
-    },
-    [lang],
-  );
-
-  // ── Manual capture button (also uses takeSnapshot) ────────────
-  const handleManualCapture = useCallback(async () => {
-    if (capturing || !cameraRef.current || snapshotFiredRef.current) {
-      clog("capture-aborted", {
-        reason: capturing ? "already-capturing"
-          : snapshotFiredRef.current ? "already-fired"
-          : "no-camera-ref",
-        eyeSide,
-      });
+    if (!cameraReadyRef.current || !camera) {
+      consecutiveRef.current = 0;
+      setDetected(false);
+      setFrameCount(0);
+      setStatusMsg("Preparing camera...");
       return;
     }
 
-    snapshotFiredRef.current = true;
+    capturingRef.current = true;
     setCapturing(true);
-    Speech.stop();
-
-    const captureStart = Date.now();
-    const currentDims  = frameDimsRef.current;
-
-    clog("capture-start", {
-      eyeSide, facing,
-      frame:    jsFrameCountRef.current,
-      rawW:     currentDims.rawW,
-      rawH:     currentDims.rawH,
-      rotation: currentDims.rotation,
-      mirror:   currentDims.mirror,
-      sessionMs: captureStart - sessionStartRef.current,
-      trigger:  "manual",
-    });
+    setStatusMsg("Capturing high-quality image...");
 
     try {
-      const photoStart = Date.now();
-      const snapshot = await cameraRef.current.takeSnapshot({
-        quality:      92,
-        skipMetadata: false,
-      });
-      const photoMs = Date.now() - photoStart;
+      // 1. Take Snapshot
+      const photo = await camera.takeSnapshot({ quality: 95 });
 
-      const uri = Platform.OS === "android"
-        ? `file://${snapshot.path}`
-        : snapshot.path;
+      const photoUri = photo.path.startsWith("file://")
+        ? photo.path
+        : `file://${photo.path}`;
 
-      clog("frame-exported", {
-        frame:          jsFrameCountRef.current,
-        cam:            facing,
-        eyeSide,
-        uri,
-        snapshotWidth:  snapshot.width,
-        snapshotHeight: snapshot.height,
-        photoMs,
-        trigger:        "manual",
-      });
+      // 2. Calculate Crop
+      const scaleX = photo.width / SW;
+      const scaleY = photo.height / SH;
 
-      const croppedUri = await cropGuideBoxTo512(uri, currentDims);
+      const cropX = Math.max(0, Math.round(GUIDE_LEFT * scaleX));
+      const cropY = Math.max(0, Math.round(GUIDE_TOP * scaleY));
+      const cropW = Math.min(
+        Math.round(GUIDE_SIZE * scaleX),
+        photo.width - cropX,
+      );
+      const cropH = Math.min(
+        Math.round(GUIDE_SIZE * scaleY),
+        photo.height - cropY,
+      );
 
-      const totalMs = Date.now() - captureStart;
-      clog("capture-complete", {
-        eyeSide, totalMs, photoMs, croppedUri,
-        sessionMs:   Date.now() - sessionStartRef.current,
-        totalFrames: jsFrameCountRef.current,
-        trigger:     "manual",
-      });
+      // 3. Crop + Resize to 512x512
+      const manipulated = await ImageManipulator.manipulateAsync(
+        photoUri,
+        [
+          {
+            crop: {
+              originX: cropX,
+              originY: cropY,
+              width: cropW,
+              height: cropH,
+            },
+          },
+          { resize: { width: OUTPUT_SIZE, height: OUTPUT_SIZE } },
+        ],
+        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
+      );
 
-      // TEMP-ANDROID-DEBUG: additive log only, does not alter navigation
-      clog("form-page-image", {
-        eyeSide,
-        croppedUri,
-        navigatingTo: "/",
-        trigger: "manual",
-      });
+      // 4. Navigate back to Form
+      if (!eyeSide) {
+        console.error("[EYE] ❌ eyeSide missing!");
+        router.back();
+        return;
+      }
+
+      const imageKey = eyeSide === "left" ? "leftEyeImage" : "rightEyeImage";
 
       router.replace({
         pathname: "/",
         params: {
-          name:         params.name         ?? "",
-          parentName:   params.parentName   ?? "",
-          phoneNumber:  params.phoneNumber  ?? "",
-          age:          params.age          ?? "",
-          gender:       params.gender       ?? "",
-          eyeSessionId: params.eyeSessionId ?? "",
-          leftEyeImage:
-            eyeSide === "left"  ? croppedUri : (params.leftEyeImage  ?? ""),
-          rightEyeImage:
-            eyeSide === "right" ? croppedUri : (params.rightEyeImage ?? ""),
+          [imageKey]: manipulated.uri,
+          name: params.name,
+          parentName: params.parentName,
+          phoneNumber: params.phoneNumber,
+          age: params.age,
+          gender: params.gender,
+          eyeSessionId: params.eyeSessionId,
         },
       });
     } catch (err: any) {
-      const totalMs = Date.now() - captureStart;
-      clog("capture-error", {
-        eyeSide, error: err?.message ?? String(err), totalMs, trigger: "manual",
-      });
-      snapshotFiredRef.current = false;
+      console.error("[EYE] ❌ CAPTURE FAILED:", err.message);
+      setStatusMsg("Capture failed – try again");
     } finally {
       setCapturing(false);
+      capturingRef.current = false;
     }
-  }, [capturing, eyeSide, params, router, facing]);
+  }, [router, eyeSide, params]);
 
-  // ── Frame processor ───────────────────────────────────────────
+  const triggerCaptureJS = Worklets.createRunOnJS(captureAndNavigate);
+
+  // ── Frame Processor ─────────────────
   const frameProcessor = useFrameProcessor(
     (frame) => {
       "worklet";
 
-      const startTotal = Date.now();
-      frameCounter.value += 1;
-      const f       = frameCounter.value;
-      const isFront = isFrontCam.value === 1;
-      const tag     = isFront ? "FRONT" : "BACK";
+      if (!model || capturingRef.current) return;
 
-      if (model == null || camReady === false) return;
-
-      const platformKey = Platform.OS === "android" ? "android" : "ios";
-      const camKey      = isFront ? "front" : "back";
-      const rotation: RotationDeg = ROTATION_CONFIG[platformKey][camKey];
-      const mirror: boolean       = MIRROR_CONFIG[platformKey][camKey];
-
-      const rawFw = frame.width;
-      const rawFh = frame.height;
-
-      if (f === 1 || f % 60 === 0) {
-        setFrameDimsJS(rawFw, rawFh, rotation, mirror);
-      }
-
-      const is90or270 = rotation === "90deg" || rotation === "270deg";
-      const fw = is90or270 ? rawFh : rawFw;
-      const fh = is90or270 ? rawFw : rawFh;
-
-      if (f === 1) {
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "resize-diagnostic",
-          cam: tag, platform: platformKey,
-          rawW: rawFw, rawH: rawFh, logicalW: fw, logicalH: fh,
-          rotation, mirror,
-          note: "If detection fails on Android, cycle ROTATION_CONFIG[android][" +
-            camKey + "] through 0/90/180/270deg and toggle MIRROR_CONFIG, then rebuild.",
-        }));
-      }
-
-      const resizeStart = Date.now();
-      let usedFallbackResize = false;
-      const resized = resize(frame, {
-        scale:       { width: MODEL_INPUT_SIZE, height: MODEL_INPUT_SIZE },
-        pixelFormat: "rgb",
-        dataType:    "float32",
-        rotation,
-        mirror,
-      });
-      const resizeMs = Date.now() - resizeStart;
-
-      if (f === 1) {
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "resize",
-          cam: tag, frame: f,
-          frameRaw:     `${rawFw}x${rawFh}`,
-          frameLogical: `${fw}x${fh}`,
-          rotation, mirror, resizeMs, usedFallback: false,
-        }));
-      } else if (usedFallbackResize) {
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "resize",
-          cam: tag, frame: f, event: "fallback-used", resizeMs,
-        }));
-      }
-
-      // ── Quality ──────────────────────────────────────────────────
-      const qualityStart = Date.now();
-      const qd = resized as Float32Array;
-      const qW = MODEL_INPUT_SIZE;
-      const qH = MODEL_INPUT_SIZE;
-
-      let lumaSum = 0, lumaCount = 0;
-      for (let qy = 0; qy < qH; qy += Q_STEP) {
-        for (let qx = 0; qx < qW; qx += Q_STEP) {
-          const b  = (qy * qW + qx) * 3;
-          const r  = qd[b]     * 255;
-          const g  = qd[b + 1] * 255;
-          const bv = qd[b + 2] * 255;
-          lumaSum += 0.299 * r + 0.587 * g + 0.114 * bv;
-          lumaCount++;
-        }
-      }
-      const brightness = lumaCount > 0 ? lumaSum / lumaCount : 0;
-      const lightStatus: LightStatus =
-        brightness < BRIGHTNESS_LOW  ? "low"  :
-        brightness > BRIGHTNESS_HIGH ? "high" : "good";
-
-      const gsW  = Math.floor(qW / Q_STEP);
-      const gsH  = Math.floor(qH / Q_STEP);
-      const gray = new Float32Array(gsW * gsH);
-      for (let sy = 0; sy < gsH; sy++) {
-        for (let sx = 0; sx < gsW; sx++) {
-          const b = (sy * Q_STEP * qW + sx * Q_STEP) * 3;
-          gray[sy * gsW + sx] =
-            0.299 * qd[b] * 255 + 0.587 * qd[b + 1] * 255 + 0.114 * qd[b + 2] * 255;
-        }
-      }
-      let lapSum = 0, lapSumSq = 0, lapCount = 0;
-      for (let ly = 1; ly < gsH - 1; ly++) {
-        for (let lx = 1; lx < gsW - 1; lx += 2) {
-          const idx = ly * gsW + lx;
-          const lap =
-            gray[(ly - 1) * gsW + lx] +
-            gray[(ly + 1) * gsW + lx] +
-            gray[ly * gsW + (lx - 1)] +
-            gray[ly * gsW + (lx + 1)] -
-            4 * gray[idx];
-          lapSum += lap; lapSumSq += lap * lap; lapCount++;
-        }
-      }
-      const blurMean  = lapCount > 0 ? lapSum / lapCount : 0;
-      const blurScore = lapCount > 0 ? lapSumSq / lapCount - blurMean * blurMean : 0;
-      const blurStatus: BlurStatus = blurScore >= BLUR_THRESHOLD ? "good" : "blurry";
-
-      let cctSumX = 0, cctSumY = 0, cctSumZ = 0, cctValid = 0;
-      for (let cy = 0; cy < qH; cy += Q_STEP) {
-        for (let cx = 0; cx < qW; cx += Q_STEP) {
-          const b   = (cy * qW + cx) * 3;
-          const rv  = qd[b];
-          const gv  = qd[b + 1];
-          const bv2 = qd[b + 2];
-          const r8  = rv  * 255, g8 = gv * 255, b8 = bv2 * 255;
-          const maxV = r8 > g8 ? (r8 > b8 ? r8 : b8) : g8 > b8 ? g8 : b8;
-          const minV = r8 < g8 ? (r8 < b8 ? r8 : b8) : g8 < b8 ? g8 : b8;
-          const sat  = maxV === 0 ? 0 : (maxV - minV) / maxV;
-          if (maxV < 35 || sat > 0.82 || (r8 > 210 && g8 < 100 && b8 < 100)) continue;
-          const rl  = rv  <= 0.04045 ? rv  / 12.92 : Math.pow((rv  + 0.055) / 1.055, 2.4);
-          const gl2 = gv  <= 0.04045 ? gv  / 12.92 : Math.pow((gv  + 0.055) / 1.055, 2.4);
-          const bl2 = bv2 <= 0.04045 ? bv2 / 12.92 : Math.pow((bv2 + 0.055) / 1.055, 2.4);
-          cctSumX += 0.4124564 * rl + 0.3575761 * gl2 + 0.1804375 * bl2;
-          cctSumY += 0.2126729 * rl + 0.7151522 * gl2 + 0.072175  * bl2;
-          cctSumZ += 0.0193339 * rl + 0.119192  * gl2 + 0.9503041 * bl2;
-          cctValid++;
-        }
-      }
-      let cct = 5500;
-      if (cctValid >= 20) {
-        const Xv  = cctSumX / cctValid;
-        const Yv  = cctSumY / cctValid;
-        const Zv  = cctSumZ / cctValid;
-        const tot = Xv + Yv + Zv;
-        if (tot > 0) {
-          const xc  = Xv / tot, yc = Yv / tot;
-          const nc  = (xc - 0.332) / (yc - 0.1858);
-          const raw = -449 * nc * nc * nc + 3525 * nc * nc - 6823.3 * nc + 5520.33;
-          cct = (raw < 2000 ? 2000 : raw > 10000 ? 10000 : raw) * CCT_WARM_BIAS;
-        }
-      }
-      const tempStatus: TempStatus = cct < CCT_WARM_THRESHOLD ? "warm" : "good";
-      const qualityMs = Date.now() - qualityStart;
-
-      const nextQuality = { blurScore, blurStatus, brightness, lightStatus, cct, tempStatus };
-      setQualityJS(nextQuality);
-      logQualityChangeJS(prevQualityRef.current, nextQuality, f, tag);
-
-      if (f % 15 === 0) {
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "quality-metrics",
-          cam: tag, frame: f,
-          brightness: +brightness.toFixed(1), lightStatus,
-          blurScore:  +blurScore.toFixed(2),
-          blurMean:   +blurMean.toFixed(2),  blurStatus,
-          cct:        +cct.toFixed(0),       cctValidPx: cctValid, tempStatus,
-          qualityMs,
-          allGood: lightStatus === "good" && blurStatus === "good" && tempStatus === "good",
-        }));
-      }
-
-      // ── Inference ────────────────────────────────────────────────
-      const inferStart = Date.now();
-      let outputs: any;
       try {
-        outputs = model.runSync([resized]);
-      } catch (e: any) {
-        setDebugInfoJS(`[${tag}] infer fail: ${e?.message ?? "?"}`);
-        return;
-      }
-      const inferMs = Date.now() - inferStart;
+        const resized = resize(frame, {
+          scale: { width: MODEL_SIZE, height: MODEL_SIZE },
+          pixelFormat: "rgb",
+          dataType: "float32",
+          rotation: "270deg",
+        });
 
-      if (!outputs || outputs.length === 0) return;
-      const raw = outputs[0] as Float32Array;
+        const outputs = model.runSync([resized]);
+        if (!outputs?.length) return;
 
-      // ── Detection ────────────────────────────────────────────────
-      const detectStart  = Date.now();
-      let bestBoxScore   = 0;
-      let validCount     = 0;
-      let partialCount   = 0;
-      let areaFailCount  = 0;
-      let totalAboveConf = 0;
-      let overlayBox: DetectedBox | null = null;
-      let overlayScore = -1;
+        const raw = outputs[0] as Float32Array;
+        let bestScore = 0;
+        let bestX1 = 0;
+        let bestY1 = 0;
+        let bestX2 = 0;
+        let bestY2 = 0;
 
-      for (let i = 0; i < NUM_DETECTIONS; i++) {
-        const base  = i * VALS_PER_BOX;
-        const score = raw[base + 4];
-        if (score < 0.05) continue;
+        for (let i = 0; i < NUM_DETECTIONS; i++) {
+          const offset = i * VALS_PER_BOX;
+          const conf = raw[offset + 4];
 
-        const nx1 = raw[base + 0], ny1 = raw[base + 1];
-        const nx2 = raw[base + 2], ny2 = raw[base + 3];
-        const bw  = nx2 - nx1, bh = ny2 - ny1;
-        if (bw <= 0 || bh <= 0 || bw > 1.5 || bh > 1.5) continue;
-
-        const bbox = validateBBox(nx1, ny1, nx2, ny2, fw, fh);
-
-        if (score >= CONF_THRESHOLD) {
-          totalAboveConf++;
-          if (bbox.type === "partial") partialCount++;
-          else if (bbox.valid !== 1)   areaFailCount++;
-        }
-
-        if (BBOX_DEBUG_LOG && score >= CONF_THRESHOLD) {
-          if (bbox.type === "full") {
-            console.log(JSON.stringify({
-              ts: Date.now(), scope: "bbox", cam: tag, frame: f,
-              x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2,
-              w: bbox.x2 - bbox.x1, h: bbox.y2 - bbox.y1,
-              type: "full", area: bbox.area,
-              areaPct: +(bbox.areaRatio * 100).toFixed(1),
-              areaMin: +(BBOX_MIN_AREA_RATIO * 100).toFixed(1),
-              areaMax: +(BBOX_MAX_AREA_RATIO * 100).toFixed(1),
-              valid: bbox.valid === 1, reason: bbox.reason,
-              score: +score.toFixed(3),
-            }));
-          } else {
-            console.log(JSON.stringify({
-              ts: Date.now(), scope: "bbox", cam: tag, frame: f,
-              type: "partial", reason: bbox.reason,
-              valid: false, score: +score.toFixed(3),
-            }));
+          if (conf > bestScore) {
+            bestScore = conf;
+            bestX1 = raw[offset];
+            bestY1 = raw[offset + 1];
+            bestX2 = raw[offset + 2];
+            bestY2 = raw[offset + 3];
           }
         }
 
-        if (score > overlayScore) {
-          overlayScore = score;
-          overlayBox = {
-            x1: bbox.x1, y1: bbox.y1, x2: bbox.x2, y2: bbox.y2,
-            score, type: bbox.type, valid: bbox.valid === 1, areaRatio: bbox.areaRatio,
-          };
+        setScoreJS(bestScore);
+
+        const eyeInsideGuide =
+          bestScore >= CONF_THRESHOLD &&
+          checkEyeWithinGuideBox(bestX1, bestY1, bestX2, bestY2);
+
+        if (bestScore >= CONF_THRESHOLD) {
+          const box = getEyeBoxOnScreen(bestX1, bestY1, bestX2, bestY2);
+          setDebugEyeBoxJS({
+            left: box.left,
+            top: box.top,
+            width: box.width,
+            height: box.height,
+            score: bestScore,
+            insideGuide: eyeInsideGuide,
+          });
+        } else {
+          setDebugEyeBoxJS(null);
         }
 
-        if (bbox.valid !== 1) continue;
-        validCount++;
-        if (score > bestBoxScore) bestBoxScore = score;
-      }
-      const detectMs = Date.now() - detectStart;
+        if (eyeInsideGuide) {
+          consecutiveRef.current += 1;
+          setDetectedJS(true);
+          setFrameCountJS(consecutiveRef.current);
 
-      if (f % 10 === 0 && totalAboveConf > 0) {
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "detection-summary", cam: tag, frame: f,
-          totalAboveConf, validCount, partialCount, areaFailCount,
-          bestScore:    +bestBoxScore.toFixed(3),
-          overlayScore: +overlayScore.toFixed(3),
-          confirmed: eyeConfirmedSV.value === 1, detectMs,
-        }));
-      }
-
-      if (overlayScore >= CONF_THRESHOLD) setDetectedBoxJS(overlayBox);
-      else setDetectedBoxJS(null);
-
-      // ── Best-of-N window ─────────────────────────────────────────
-      const window = frameWindow.value;
-      window.push(bestBoxScore);
-      if (window.length > BEST_OF_FRAMES) window.shift();
-      frameWindow.value = window;
-
-      const allAbove =
-        window.length === BEST_OF_FRAMES &&
-        window.every((s) => s >= CONF_THRESHOLD);
-
-      if (allAbove && eyeConfirmedSV.value === 0) {
-        eyeConfirmedSV.value = 1;
-        setEyeConfirmedJS(true);
-
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "eye-confirmed", cam: tag, frame: f,
-          windowScores: window.map((s) => +s.toFixed(3)),
-          windowMin:    +Math.min(...window).toFixed(3),
-          windowAvg:    +(window.reduce((a, b) => a + b, 0) / window.length).toFixed(3),
-          inferMs, resizeMs,
-          quality: {
-            brightness:  +brightness.toFixed(1),  lightStatus,
-            blurScore:   +blurScore.toFixed(1),   blurStatus,
-            cct:         +cct.toFixed(0),         tempStatus,
-          },
-        }));
-
-        // Signal JS — takeSnapshot() will be called immediately.
-        // This is the ONLY change from the original flow.
-        onFrameConfirmedJS(f, tag);
-      }
-
-      // ── Perf ─────────────────────────────────────────────────────
-      const totalMs = Date.now() - startTotal;
-      trackPerfJS(resizeMs, qualityMs, inferMs, detectMs, totalMs);
-
-      if (f % 30 === 0) {
-        console.log(JSON.stringify({
-          ts: Date.now(), scope: "frame-perf", cam: tag, frame: f,
-          timing: { totalMs, resizeMs, qualityMs, inferMs, detectMs },
-          detection: {
-            bestScore: +bestBoxScore.toFixed(3), validCount,
-            partialCount, areaFailCount, totalAboveConf,
-          },
-          window: {
-            scores: window.map((s) => +s.toFixed(3)),
-            size: window.length, allAbove,
-          },
-          confirmed: eyeConfirmedSV.value === 1,
-          quality: {
-            brightness: +brightness.toFixed(1), lightStatus,
-            blurScore:  +blurScore.toFixed(1),  blurStatus,
-            cct:        +cct.toFixed(0),        tempStatus,
-          },
-          frameMeta: {
-            rawW: rawFw, rawH: rawFh, logicalW: fw, logicalH: fh,
-            rotation, mirror, fallbackResize: usedFallbackResize,
-          },
-        }));
-        logPerfSummaryJS(f, tag);
-      }
-
-      if (bestBoxScore >= CONF_THRESHOLD) {
-        setDebugInfoJS(
-          `[${tag}] score:${bestBoxScore.toFixed(2)} ` +
-          `window:[${window.map((s) => s.toFixed(2)).join(",")}] ` +
-          `confirmed:${eyeConfirmedSV.value === 1 ? "✅" : "⏳"}`,
-        );
-      } else if (f % 15 === 0) {
-        setDebugInfoJS(
-          `[${tag}] no det score:${bestBoxScore.toFixed(2)} ` +
-          `window:[${window.map((s) => s.toFixed(2)).join(",")}] ` +
-          `confirmed:${eyeConfirmedSV.value === 1 ? "✅" : "⏳"}`,
-        );
+          if (consecutiveRef.current >= FRAMES_NEEDED) {
+            consecutiveRef.current = 0;
+            triggerCaptureJS();
+          } else {
+            setStatusMsgJS(
+              `Hold still... ${consecutiveRef.current}/${FRAMES_NEEDED}`,
+            );
+          }
+        } else {
+          consecutiveRef.current = 0;
+          setDetectedJS(false);
+          setFrameCountJS(0);
+          setStatusMsgJS(
+            bestScore >= CONF_THRESHOLD
+              ? "Keep full eye inside the box"
+              : "Position eye in the box",
+          );
+        }
+      } catch {
+        // Keep the frame processor alive if a single frame fails.
       }
     },
-    [model, camReady],
+    [model],
   );
 
-  // ── Guards ─────────────────────────────────────────────────────
-  if (!hasPermission) return (
-    <View style={s.center}>
-      <Text style={s.permText}>No Camera Permission</Text>
-      <TouchableOpacity style={s.permBtn} onPress={requestPermission}>
-        <Text style={s.permBtnText}>Grant Permission</Text>
-      </TouchableOpacity>
-    </View>
-  );
-  if (device == null) return (
-    <View style={s.center}><Text style={s.permText}>No Camera Found</Text></View>
-  );
-  if (state === "loading") return (
-    <View style={s.center}>
-      <ActivityIndicator size="large" color="#00c853" />
-      <Text style={[s.permText, { marginTop: 14 }]}>Loading model…</Text>
-    </View>
-  );
-  if (state === "error") return (
-    <View style={s.center}>
-      <Text style={[s.permText, { color: "#ff5555" }]}>❌ Model failed to load</Text>
-    </View>
-  );
+  if (!hasPermission) {
+    return (
+      <View style={s.center}>
+        <Text style={s.permText} onPress={requestPermission}>
+          Tap to grant camera permission
+        </Text>
+      </View>
+    );
+  }
 
-  const instrText  = VOICE[problemKey]?.[lang]?.text ?? "";
-  const guideColor = allGood ? "#00ff66" : eyeConfirmed ? "#FFD700" : "#4c9fff";
-  const sideLabel  = eyeSide === "left" ? "LEFT EYE" : "RIGHT EYE";
+  if (!device) {
+    return (
+      <View style={s.center}>
+        <Text style={s.label}>No front camera found</Text>
+      </View>
+    );
+  }
 
-  let captureBtnLabel = "Waiting…";
-  if (capturing)                         captureBtnLabel = "Capturing…";
-  else if (allGood)                      captureBtnLabel = "📸 Auto-capturing…";
-  else if (eyeConfirmed && !qualityGood) captureBtnLabel = "Eye ✅ — Fix quality";
-  else if (!eyeConfirmed)                captureBtnLabel = "Align eye…";
+  const progressPct = Math.round((frameCount / FRAMES_NEEDED) * 100);
 
   return (
     <View style={s.root}>
       <Camera
         ref={cameraRef}
-        key={facing}
         style={StyleSheet.absoluteFill}
         device={device}
-        isActive={true}
+        isActive={!capturing}
         frameProcessor={frameProcessor}
-        photo={true}
         onInitialized={() => {
-          clog("camera-initialized", {
-            facing,
-            deviceId:   device?.id,
-            deviceName: device?.name,
-            hasFlash:   device?.hasFlash,
-            minZoom:    device?.minZoom,
-            maxZoom:    device?.maxZoom,
-            formats:    device?.formats?.length ?? 0,
-            initMs:     Date.now() - sessionStartRef.current,
-          });
-          setCamReady(true);
+          cameraReadyRef.current = true;
         }}
-        onError={(e) => {
-          clog("camera-error", {
-            facing, error: e.message, code: (e as any).code,
-          });
-          setDebugInfo(`Cam error: ${e.message}`);
-          setCamReady(false);
-          setTimeout(() => setCamReady(true), 1200);
+        onError={() => {
+          cameraReadyRef.current = false;
+          setStatusMsg("Camera error - try again");
         }}
+        photo
       />
 
-      {!camReady && (
-        <View style={s.switchingOverlay}>
-          <ActivityIndicator color="#fff" />
-          <Text style={[s.permText, { marginTop: 8 }]}>
-            Switching to {facing}…
-          </Text>
-        </View>
-      )}
+      {/* UI remains same */}
+      <View style={[s.vig, { top: 0, left: 0, right: 0, height: GUIDE_TOP }]} />
+      <View
+        style={[
+          s.vig,
+          { top: GUIDE_TOP + GUIDE_SIZE, left: 0, right: 0, bottom: 0 },
+        ]}
+      />
+      <View
+        style={[
+          s.vig,
+          { top: GUIDE_TOP, left: 0, width: GUIDE_LEFT, height: GUIDE_SIZE },
+        ]}
+      />
+      <View
+        style={[
+          s.vig,
+          {
+            top: GUIDE_TOP,
+            left: GUIDE_LEFT + GUIDE_SIZE,
+            right: 0,
+            height: GUIDE_SIZE,
+          },
+        ]}
+      />
 
-      {/* TEMP-ANDROID-DEBUG: floating panel, renders nothing unless enabled+Android */}
-      {DEBUG_MODE_ANDROID && Platform.OS === "android" && (
-        <AndroidDebugPanel events={debugEvents} />
-      )}
-
-      {/* TOP PANEL */}
-      <View style={s.topPanel}>
-        <View style={s.controlRow}>
-          <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
-            <Text style={s.backBtnText}>← Back</Text>
-          </TouchableOpacity>
-
-          <View style={s.sideLabel}>
-            <Text style={s.sideLabelText}>{sideLabel}</Text>
-          </View>
-
-          <View style={s.rightControls}>
-            <View style={s.radioGroup}>
-              {(["en", "hi", "te"] as Lang[]).map((l, idx) => (
-                <TouchableOpacity
-                  key={l}
-                  style={[
-                    s.radioBtn,
-                    idx === 0 && s.radioBtnFirst,
-                    idx === 2 && s.radioBtnLast,
-                    lang === l && s.radioBtnActive,
-                  ]}
-                  onPress={() => handleLangChange(l)}
-                >
-                  <Text style={[s.radioLabel, lang === l && s.radioLabelActive]}>
-                    {l === "en" ? "EN" : l === "hi" ? "हि" : "తె"}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <TouchableOpacity
-              style={s.flipBtn}
-              onPress={() => {
-                const next = facing === "front" ? "back" : "front";
-                clog("camera-flip", {
-                  from: facing, to: next,
-                  frame: jsFrameCountRef.current, eyeConfirmed,
-                });
-                setCamReady(false);
-                setFacing((f) => (f === "front" ? "back" : "front"));
-              }}
-            >
-              <IconFlip size={16} color="#fff" />
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* Indicators */}
-        <View style={s.indicatorRow}>
-          {[
-            { icon: <IconEye   size={18} color="#fff" />, label: "EYE",   ok: eyeConfirmed },
-            { icon: <IconLight size={18} color="#fff" />, label: "LIGHT", ok: quality.lightStatus === "good" },
-            { icon: <IconBlur  size={18} color="#fff" />, label: "SHARP", ok: quality.blurStatus  === "good" },
-            { icon: <IconLight size={18} color="#fff" />, label: "COLOR", ok: quality.tempStatus  === "good" },
-          ].map(({ icon, label, ok }) => (
-            <View key={label} style={s.indicator}>
-              <View style={s.indicatorHeader}>
-                {icon}
-                <Text style={s.indicatorLabel}>{label}</Text>
-              </View>
-              <View style={[s.indicatorBlock, { backgroundColor: ok ? "#a8e6a3" : "#f4a97f" }]} />
-            </View>
-          ))}
-        </View>
-
-        <View style={[
-          s.instrBox,
-          { borderColor: allGood ? "#00e676" : eyeConfirmed ? "#FFD700" : "rgba(255,255,255,0.15)" },
-        ]}>
-          {isSpeaking && (
-            <View style={s.speakingDot}>
-              <View style={[s.speakingPulse, { backgroundColor: allGood ? "#00e676" : "#f4a97f" }]} />
-            </View>
-          )}
-          <Text style={[s.instrText, { color: allGood ? "#00e676" : eyeConfirmed ? "#FFD700" : "#fff" }]}>
-            {instrText}
-          </Text>
-          <TouchableOpacity style={s.speakBtn} onPress={() => speakNow(problemKey)}>
-            <IconSpeaker size={20} color={allGood ? "#00e676" : "#fff"} />
-          </TouchableOpacity>
-        </View>
-
-        <View style={s.hintBox}>
-          <Text style={s.hintText}>
-            📱 Hold 10–15 cm • Pull lower eyelid • Keep full eye inside box
-          </Text>
-        </View>
-      </View>
-
-      {/* CAMERA WINDOW */}
-      <View style={s.cameraWindow}>
-        <View style={[
+      <View
+        style={[
           s.guide,
-          { borderColor: guideColor, width: GUIDE_SCREEN_SIZE, height: GUIDE_SCREEN_SIZE },
-        ]}>
-          {(["TL", "TR", "BL", "BR"] as const).map((c) => (
-            <View
-              key={c}
-              style={[s.corner, (s as any)[`corner${c}`], { borderColor: guideColor }]}
-            />
-          ))}
-          <View style={s.verticalLine} />
-          <View style={s.horizontalLine} />
-          <View style={[s.centerDot, { borderColor: guideColor }]} />
-        </View>
-        <Text style={s.guideLabel}>512 × 512</Text>
-        {detectedBox && (
-          <Text style={[s.guideLabel, {
-            color: detectedBox.valid
-              ? "#00e676"
-              : detectedBox.type === "partial" ? "#ff5252" : "#ffb74d",
-          }]}>
-            {detectedBox.type === "partial"
-              ? "partial — touching border"
-              : `${detectedBox.valid ? "valid" : "full — area out of range"} · area ${(detectedBox.areaRatio * 100).toFixed(1)}% · score ${detectedBox.score.toFixed(2)}`}
+          detected && !capturing && s.guideDetected,
+          capturing && s.guideCapturing,
+        ]}
+      />
+
+      {debugEyeBox && (
+        <View
+          pointerEvents="none"
+          style={[
+            s.debugEyeBox,
+            debugEyeBox.insideGuide
+              ? s.debugEyeBoxInside
+              : s.debugEyeBoxOutside,
+            {
+              left: debugEyeBox.left,
+              top: debugEyeBox.top,
+              width: debugEyeBox.width,
+              height: debugEyeBox.height,
+            },
+          ]}
+        >
+          <Text
+            style={[
+              s.debugEyeBoxLabel,
+              debugEyeBox.insideGuide
+                ? s.debugEyeBoxLabelInside
+                : s.debugEyeBoxLabelOutside,
+            ]}
+          >
+            {debugEyeBox.insideGuide ? "IN" : "OUT"}{" "}
+            {debugEyeBox.score.toFixed(2)}
           </Text>
-        )}
+        </View>
+      )}
+
+      <View style={s.topLabel}>
+        <Text style={s.eyeTitle}>EYE DETECTION</Text>
+        <Text style={s.eyeSub}>
+          Centre your {eyeSide.toUpperCase()} eye inside the box
+        </Text>
       </View>
 
-      {/* BOTTOM AREA */}
-      <View style={s.captureArea}>
-        <Text style={s.debugText}>{debugInfo}</Text>
-        <Text style={s.debugText}>
-          Blur:{quality.blurScore.toFixed(0)} | Bright:{quality.brightness.toFixed(0)} | {quality.cct.toFixed(0)}K | cam:{facing} | ready:{camReady ? "✅" : "⏳"} | eye:{eyeConfirmed ? "✅" : "⏳"}
-        </Text>
-        <Text style={s.debugText}>
-          avg infer:{avgPerf("infer").toFixed(0)}ms | avg total:{avgPerf("total").toFixed(0)}ms | p95 total:{p95Perf("total").toFixed(0)}ms | frames:{jsFrameCountRef.current}
-        </Text>
-        <Text style={s.debugText}>
-          rawDims:{frameDimsRef.current.rawW}×{frameDimsRef.current.rawH} | rot:{frameDimsRef.current.rotation} | mir:{frameDimsRef.current.mirror ? "Y" : "N"} | plat:{Platform.OS}
-        </Text>
+      <View style={s.progressTrack}>
+        <View style={[s.progressFill, { width: `${progressPct}%` }]} />
+      </View>
 
-        <TouchableOpacity
-          style={[
-            s.captureBtn,
-            {
-              backgroundColor: allGood ? "#00c853" : eyeConfirmed ? "#7c4dff" : "#2a2a2a",
-              borderColor:     allGood ? "#00ff66" : eyeConfirmed ? "#b39ddb" : "#444",
-            },
-            capturing && { opacity: 0.6 },
-          ]}
-          onPress={handleManualCapture}
-          disabled={capturing}
-          activeOpacity={0.75}
-        >
-          {capturing ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={[s.captureBtnText, { opacity: eyeConfirmed ? 1 : 0.4 }]}>
-              {captureBtnLabel}
+      <View style={s.hud}>
+        {capturing ? (
+          <View style={s.row}>
+            <ActivityIndicator color="#fff" size="small" />
+            <Text style={s.hudText}> Processing image…</Text>
+          </View>
+        ) : (
+          <>
+            <Text
+              style={[s.statusText, detected ? s.statusGreen : s.statusGray]}
+            >
+              {statusMsg}
             </Text>
-          )}
-        </TouchableOpacity>
+            <View style={s.row}>
+              <HudPill label="Side" value={eyeSide.toUpperCase()} />
+              <HudPill label="Model" value={modelState} />
+              <HudPill label="Score" value={score.toFixed(3)} />
+              <HudPill
+                label="Frames"
+                value={`${frameCount}/${FRAMES_NEEDED}`}
+              />
+            </View>
+          </>
+        )}
       </View>
     </View>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  STYLES
-// ─────────────────────────────────────────────────────────────────
+function HudPill({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={s.pill}>
+      <Text style={s.pillLabel}>{label}</Text>
+      <Text style={s.pillValue}>{value}</Text>
+    </View>
+  );
+}
+
 const s = StyleSheet.create({
-  root:   { flex: 1, backgroundColor: "#000" },
-  center: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#000", padding: 24 },
-  permText:    { color: "#fff", fontSize: 16, marginBottom: 20, textAlign: "center" },
-  permBtn:     { backgroundColor: "#00c853", paddingVertical: 14, paddingHorizontal: 30, borderRadius: 12 },
-  permBtnText: { color: "#fff", fontWeight: "700", fontSize: 16 },
-
-  switchingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "#000000cc",
-    justifyContent: "center", alignItems: "center", zIndex: 99,
+  // ... (your existing styles - unchanged)
+  root: { flex: 1, backgroundColor: "#000" },
+  center: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#000",
   },
+  permText: {
+    fontSize: 17,
+    color: "#5b2d8e",
+    textAlign: "center",
+    padding: 24,
+  },
+  label: { fontSize: 16, color: "#fff" },
 
-  topPanel:   { paddingTop: 54, paddingHorizontal: 12, paddingBottom: 10, backgroundColor: "rgba(0,0,0,0.80)", gap: 8, zIndex: 10 },
-  controlRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  vig: { position: "absolute", backgroundColor: "rgba(0,0,0,0.58)" },
 
-  backBtn:     { paddingVertical: 7, paddingHorizontal: 14, borderRadius: 10, backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
-  backBtnText: { color: "#fff", fontSize: 13, fontWeight: "600" },
+  guide: {
+    position: "absolute",
+    left: GUIDE_LEFT,
+    top: GUIDE_TOP,
+    width: GUIDE_SIZE,
+    height: GUIDE_SIZE,
+    borderWidth: 2.5,
+    borderStyle: "dashed",
+    borderColor: "#00e676",
+    borderRadius: 6,
+  },
+  guideDetected: { borderStyle: "solid", borderColor: "#00e676" },
+  guideCapturing: { borderStyle: "solid", borderColor: "#ffeb3b" },
+  debugEyeBox: {
+    position: "absolute",
+    borderWidth: 2,
+    borderRadius: 4,
+    zIndex: 5,
+  },
+  debugEyeBoxInside: { borderColor: "#00e676" },
+  debugEyeBoxOutside: { borderColor: "#ff5252" },
+  debugEyeBoxLabel: {
+    position: "absolute",
+    top: -22,
+    left: -2,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    color: "#000",
+    fontSize: 10,
+    fontWeight: "900",
+    overflow: "hidden",
+  },
+  debugEyeBoxLabelInside: { backgroundColor: "#00e676" },
+  debugEyeBoxLabelOutside: { backgroundColor: "#ff5252", color: "#fff" },
 
-  sideLabel:     { backgroundColor: "rgba(91,45,142,0.8)", paddingVertical: 5, paddingHorizontal: 14, borderRadius: 20 },
-  sideLabelText: { color: "#fff", fontWeight: "700", fontSize: 13, letterSpacing: 1 },
+  topLabel: {
+    position: "absolute",
+    top: 56,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+  },
+  eyeTitle: {
+    fontSize: 20,
+    fontWeight: "900",
+    color: "#fff",
+    letterSpacing: 3,
+  },
+  eyeSub: { fontSize: 12, color: "rgba(255,255,255,0.55)", marginTop: 4 },
 
-  rightControls: { flexDirection: "row", alignItems: "center", gap: 8 },
-  radioGroup:    { flexDirection: "row", borderRadius: 10, overflow: "hidden", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
-  radioBtn:      { paddingVertical: 7, paddingHorizontal: 12, backgroundColor: "rgba(255,255,255,0.07)", borderRightWidth: 1, borderRightColor: "rgba(255,255,255,0.15)" },
-  radioBtnFirst: { borderTopLeftRadius: 10,  borderBottomLeftRadius: 10  },
-  radioBtnLast:  { borderTopRightRadius: 10, borderBottomRightRadius: 10, borderRightWidth: 0 },
-  radioBtnActive:   { backgroundColor: "rgba(255,215,0,0.18)" },
-  radioLabel:       { color: "rgba(255,255,255,0.6)", fontSize: 12, fontWeight: "700" },
-  radioLabelActive: { color: "#FFD700" },
-  flipBtn: { paddingVertical: 7, paddingHorizontal: 10, borderRadius: 10, backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
+  progressTrack: {
+    position: "absolute",
+    top: GUIDE_TOP + GUIDE_SIZE + 10,
+    left: GUIDE_LEFT,
+    width: GUIDE_SIZE,
+    height: 4,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    borderRadius: 2,
+    overflow: "hidden",
+  },
+  progressFill: { height: 4, borderRadius: 2 },
 
-  indicatorRow:    { flexDirection: "row", justifyContent: "space-between", gap: 10 },
-  indicator:       { flex: 1, alignItems: "flex-start", gap: 6 },
-  indicatorHeader: { flexDirection: "row", alignItems: "center", gap: 6 },
-  indicatorLabel:  { color: "#fff", fontSize: 13, fontWeight: "800", letterSpacing: 0.5 },
-  indicatorBlock:  { width: "100%", height: 22, borderRadius: 10 },
+  hud: {
+    position: "absolute",
+    bottom: 44,
+    left: 16,
+    right: 16,
+    backgroundColor: "rgba(0,0,0,0.78)",
+    borderRadius: 14,
+    padding: 14,
+    gap: 8,
+  },
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-around",
+  },
+  hudText: { color: "#fff", fontSize: 15, fontWeight: "600" },
+  statusText: { fontSize: 14, fontWeight: "700", textAlign: "center" },
+  statusGreen: { color: "#00e676" },
+  statusGray: { color: "rgba(255,255,255,0.55)" },
 
-  instrBox:      { borderWidth: 1, borderRadius: 12, paddingVertical: 11, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", backgroundColor: "rgba(255,255,255,0.06)" },
-  speakingDot:   { marginRight: 10, justifyContent: "center", alignItems: "center" },
-  speakingPulse: { width: 10, height: 10, borderRadius: 5, opacity: 0.9 },
-  instrText:     { flex: 1, fontSize: 14, fontWeight: "700" },
-  speakBtn:      { paddingLeft: 10 },
-
-  hintBox:  { backgroundColor: "rgba(255,255,255,0.06)", borderRadius: 10, paddingVertical: 7, paddingHorizontal: 12 },
-  hintText: { color: "rgba(255,255,255,0.55)", fontSize: 11, textAlign: "center" },
-
-  cameraWindow: { flex: 1, justifyContent: "center", alignItems: "center", gap: 8 },
-
-  guide:      { borderWidth: 2, borderRadius: 16, borderStyle: "dashed", justifyContent: "center", alignItems: "center" },
-  guideLabel: { color: "rgba(255,255,255,0.35)", fontSize: 11, fontFamily: "monospace" },
-
-  corner:   { position: "absolute", width: 22, height: 22, borderWidth: 3 },
-  cornerTL: { top: -2,    left:  -2, borderBottomWidth: 0, borderRightWidth: 0, borderTopLeftRadius:     8 },
-  cornerTR: { top: -2,    right: -2, borderBottomWidth: 0, borderLeftWidth:  0, borderTopRightRadius:    8 },
-  cornerBL: { bottom: -2, left:  -2, borderTopWidth:    0, borderRightWidth: 0, borderBottomLeftRadius:  8 },
-  cornerBR: { bottom: -2, right: -2, borderTopWidth:    0, borderLeftWidth:  0, borderBottomRightRadius: 8 },
-  verticalLine:   { position: "absolute", width: 1,  height: "80%", backgroundColor: "rgba(255,255,255,0.2)" },
-  horizontalLine: { position: "absolute", height: 1, width:  "80%", backgroundColor: "rgba(255,255,255,0.2)" },
-  centerDot:      { width: 12, height: 12, borderRadius: 6, borderWidth: 2 },
-
-  captureArea:    { paddingVertical: 16, alignItems: "center", gap: 6, backgroundColor: "rgba(0,0,0,0.65)" },
-  captureBtn:     { paddingVertical: 18, paddingHorizontal: 56, borderRadius: 80, borderWidth: 2, alignItems: "center", justifyContent: "center", minWidth: 200, minHeight: 60 },
-  captureBtnText: { color: "#fff", fontSize: 20, fontWeight: "bold" },
-  debugText:      { color: "rgba(255,255,255,0.35)", fontSize: 10, fontFamily: "monospace" },
-} as any);
+  pill: { alignItems: "center", gap: 2 },
+  pillLabel: {
+    fontSize: 10,
+    color: "rgba(255,255,255,0.45)",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  pillValue: { fontSize: 13, color: "#fff", fontWeight: "600" },
+});
