@@ -12,7 +12,8 @@ import { PieChart } from "react-native-chart-kit";
 const Icon = MaterialCommunityIcons;
 
 // const BASE_URL = "http://10.2.136.235:5001";
-const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2/";
+const BASE_URL = "http://192.168.1.11:5001";
+// const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2/";
 const { width: SW } = Dimensions.get("window");
 
 const C = {

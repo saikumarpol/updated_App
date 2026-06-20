@@ -1,29 +1,31 @@
 // app/index.tsx
-import { useState, useEffect, useRef } from "react";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
+import axios from "axios";
+import { useLocalSearchParams, useRouter } from "expo-router";
+import { useEffect, useRef, useState } from "react";
 import {
-  View, TextInput, ScrollView, Image, Text, Alert,
-  StyleSheet, TouchableOpacity, ActivityIndicator,
-  Platform, KeyboardAvoidingView, Modal, Dimensions, StatusBar,
+  ActivityIndicator,
+  Alert,
+  Dimensions,
+  Image,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import axios from "axios";
-import { useRouter, useLocalSearchParams } from "expo-router";
-import { MaterialCommunityIcons } from "@expo/vector-icons";
-
-// expo-av audio recording (install: npx expo install expo-av)
-// If expo-av is not yet installed, the audio section will show a placeholder.
-let Audio: any = null;
-try {
-  Audio = require("expo-av").Audio;
-} catch {
-  // expo-av not installed — audio consent will be disabled
-}
 
 const Icon = MaterialCommunityIcons;
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-// const BASE_URL = "http://10.2.136.235:5001";
-const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2/";
+// const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2/";
+const BASE_URL = "http://192.168.1.11:5001";
 const { width: SW } = Dimensions.get("window");
 
 const C = {
@@ -55,53 +57,49 @@ export default function FormScreen() {
   }>();
 
   // ── Form state ─────────────────────────────────────────────────
-  const [name, setName]               = useState("");
-  const [parentName, setParentName]   = useState("");
+  const [name, setName] = useState("");
+  const [parentName, setParentName] = useState("");
   const [phoneNumber, setPhoneNumber] = useState("");
-  const [age, setAge]                 = useState("");
-  const [gender, setGender]           = useState("");
+  const [age, setAge] = useState("");
+  const [gender, setGender] = useState("");
 
   // ── Eye images ─────────────────────────────────────────────────
-  const [leftEyeImage, setLeftEyeImage]   = useState<string | null>(null);
+  const [leftEyeImage, setLeftEyeImage] = useState<string | null>(null);
   const [rightEyeImage, setRightEyeImage] = useState<string | null>(null);
-  const [eyeSessionId, setEyeSessionId]   = useState("");
-
-  // ── Audio consent ──────────────────────────────────────────────
-  const [audioUri, setAudioUri]       = useState<string | null>(null);
-  const [isRecording, setIsRecording] = useState(false);
-  const recordingRef                  = useRef<any>(null);
-  const audioAvailable                = Audio !== null;
+  const [eyeSessionId, setEyeSessionId] = useState("");
 
   // ── UI ─────────────────────────────────────────────────────────
-  const [loading, setLoading]       = useState(false);
+  const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("Processing...");
   const [previewUri, setPreviewUri] = useState<string | null>(null);
 
   // Restore form fields when returning from eye-capture
   useEffect(() => {
-    if (params.name)          setName(params.name);
-    if (params.parentName)    setParentName(params.parentName);
-    if (params.phoneNumber)   setPhoneNumber(params.phoneNumber);
-    if (params.age)           setAge(params.age);
-    if (params.gender)        setGender(params.gender);
-    if (params.eyeSessionId)  setEyeSessionId(params.eyeSessionId);
-    if (params.leftEyeImage)  setLeftEyeImage(params.leftEyeImage);
+    if (params.name) setName(params.name);
+    if (params.parentName) setParentName(params.parentName);
+    if (params.phoneNumber) setPhoneNumber(params.phoneNumber);
+    if (params.age) setAge(params.age);
+    if (params.gender) setGender(params.gender);
+    if (params.eyeSessionId) setEyeSessionId(params.eyeSessionId);
+    if (params.leftEyeImage) setLeftEyeImage(params.leftEyeImage);
     if (params.rightEyeImage) setRightEyeImage(params.rightEyeImage);
   }, [params]);
 
   // ── Helpers ────────────────────────────────────────────────────
-  const isMinor       = age ? parseInt(age) < 18 : false;
+  const isMinor = age ? parseInt(age) < 18 : false;
   const capturedCount = [leftEyeImage, rightEyeImage].filter(Boolean).length;
-  const progress      = Math.min(
+  const hasAnyEyeImage = capturedCount > 0;
+
+  // Progress: 50% for having at least one eye image, 50% for any personal info
+  const progress = Math.min(
     100,
-    (capturedCount / 2) * 50 + (name && age && gender ? 50 : 0)
+    (hasAnyEyeImage ? 50 : 0) + (name || age || gender ? 50 : 0)
   );
 
   const resetForm = () => {
     setName(""); setParentName(""); setPhoneNumber("");
     setAge(""); setGender("");
     setLeftEyeImage(null); setRightEyeImage(null); setEyeSessionId("");
-    setAudioUri(null);
   };
 
   const goToCapture = (side: "left" | "right") => {
@@ -109,70 +107,18 @@ export default function FormScreen() {
       pathname: "/eye-capture",
       params: {
         name, parentName, phoneNumber, age, gender, eyeSessionId,
-        leftEyeImage:  leftEyeImage  ?? "",
+        leftEyeImage: leftEyeImage ?? "",
         rightEyeImage: rightEyeImage ?? "",
         eyeSide: side,
       },
     });
   };
 
-  // ── Audio recording ────────────────────────────────────────────
-  const startRecording = async () => {
-    if (!audioAvailable) {
-      Alert.alert(
-        "expo-av not installed",
-        "Run: npx expo install expo-av\nThen rebuild the app.",
-      );
-      return;
-    }
-    try {
-      const perm = await Audio.requestPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert("Permission Denied", "Microphone permission is required.");
-        return;
-      }
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-      const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
-      recordingRef.current = recording;
-      setIsRecording(true);
-    } catch (e: any) {
-      Alert.alert("Error", `Failed to start recording: ${e?.message ?? ""}`);
-    }
-  };
-
-  const stopRecording = async () => {
-    try {
-      if (!recordingRef.current) return;
-      await recordingRef.current.stopAndUnloadAsync();
-      const uri = recordingRef.current.getURI();
-      setAudioUri(uri);
-      setIsRecording(false);
-    } catch (e: any) {
-      Alert.alert("Error", `Failed to stop recording: ${e?.message ?? ""}`);
-    }
-  };
-
   // ── Submit ─────────────────────────────────────────────────────
   const submitData = async () => {
-    if (!leftEyeImage || !rightEyeImage) {
-      Alert.alert("Missing", "Please capture both eye images.");
-      return;
-    }
-    if (!name || !age || !gender) {
-      Alert.alert("Missing", "Please fill all required fields (*).");
-      return;
-    }
-    if (isMinor && !parentName) {
-      Alert.alert("Missing", "Parent/Guardian name is required for minors.");
-      return;
-    }
-    if (audioAvailable && !audioUri) {
-      Alert.alert("Consent Required", "Please record your audio consent.");
+    // Only require at least one eye image — everything else is optional
+    if (!leftEyeImage && !rightEyeImage) {
+      Alert.alert("Missing Image", "Please capture at least one eye image.");
       return;
     }
 
@@ -180,35 +126,31 @@ export default function FormScreen() {
     setLoadingMsg("Uploading images...");
 
     const formData = new FormData();
-    formData.append("name", name);
+    formData.append("name", name || "");
     formData.append("parentName", parentName || "");
     formData.append("phoneNumber", phoneNumber || "");
-    formData.append("age", age);
-    formData.append("gender", gender);
+    formData.append("age", age || "");
+    formData.append("gender", gender || "");
     if (eyeSessionId) formData.append("eyeSessionId", eyeSessionId);
 
-    formData.append("leftEyeImage", {
-      uri: leftEyeImage,
-      type: "image/jpeg",
-      name: `left_${Date.now()}.jpg`,
-    } as any);
-    formData.append("rightEyeImage", {
-      uri: rightEyeImage,
-      type: "image/jpeg",
-      name: `right_${Date.now()}.jpg`,
-    } as any);
-    if (audioUri) {
-      formData.append("audioConsent", {
-        uri: audioUri,
-        type: "audio/m4a",
-        name: `consent_${Date.now()}.m4a`,
+    if (leftEyeImage) {
+      formData.append("leftEyeImage", {
+        uri: leftEyeImage,
+        type: "image/jpeg",
+        name: `left_${Date.now()}.jpg`,
+      } as any);
+    }
+    if (rightEyeImage) {
+      formData.append("rightEyeImage", {
+        uri: rightEyeImage,
+        type: "image/jpeg",
+        name: `right_${Date.now()}.jpg`,
       } as any);
     }
 
     const MESSAGES = [
-      "Uploading images…",
-      "Analysing left eye…",
-      "Analysing right eye…",
+      "Uploading image…",
+      "Analysing eye…",
       "Finalizing…",
     ];
     let msgIdx = 0;
@@ -225,10 +167,16 @@ export default function FormScreen() {
       clearInterval(msgTimer);
       const d = res.data;
 
+      const leftLine = leftEyeImage
+        ? `Left Eye  → Hb: ${d.leftHb ?? "N/A"} | ${d.leftAnemia ?? "Unknown"}\n\n`
+        : "";
+      const rightLine = rightEyeImage
+        ? `Right Eye → Hb: ${d.rightHb ?? "N/A"} | ${d.rightAnemia ?? "Unknown"}`
+        : "";
+
       Alert.alert(
         "✅ Analysis Complete",
-        `Left Eye  → Hb: ${d.leftHb ?? "N/A"} | ${d.leftAnemia ?? "Unknown"}\n\n` +
-        `Right Eye → Hb: ${d.rightHb ?? "N/A"} | ${d.rightAnemia ?? "Unknown"}`,
+        leftLine + rightLine,
         [{
           text: "View Dashboard",
           onPress: () => { resetForm(); router.replace("/(tabs)/dashboard"); },
@@ -253,7 +201,7 @@ export default function FormScreen() {
       <View style={s.header}>
         <View style={{ flex: 1 }}>
           <Text style={s.headerTitle}>New Assessment</Text>
-          <Text style={s.headerSub}>Fill all required fields</Text>
+          <Text style={s.headerSub}>All fields are optional</Text>
         </View>
         <TouchableOpacity
           style={s.dashBtn}
@@ -281,13 +229,13 @@ export default function FormScreen() {
           {/* ── Personal Info ── */}
           <View style={s.card}>
             <Text style={s.sect}>Personal Info</Text>
-            <Field label="Name *"         value={name}        onChange={setName}        placeholder="Enter full name" />
-            <Field label="Age (years) *"  value={age}         onChange={setAge}         placeholder="Age" keyboard="numeric" />
-            <Field label="Phone Number"   value={phoneNumber} onChange={setPhoneNumber} placeholder="10-digit mobile number" keyboard="phone-pad" />
+            <Field label="Name" value={name} onChange={setName} placeholder="Enter full name" />
+            <Field label="Age (years)" value={age} onChange={setAge} placeholder="Age" keyboard="numeric" />
+            <Field label="Phone Number" value={phoneNumber} onChange={setPhoneNumber} placeholder="10-digit mobile number" keyboard="phone-pad" />
             {isMinor && (
-              <Field label="Parent/Guardian Name *" value={parentName} onChange={setParentName} placeholder="Enter parent name" />
+              <Field label="Parent/Guardian Name" value={parentName} onChange={setParentName} placeholder="Enter parent name" />
             )}
-            <Text style={s.fieldLabel}>Gender *</Text>
+            <Text style={s.fieldLabel}>Gender</Text>
             <View style={s.genderRow}>
               {(["Male", "Female"] as const).map((g) => (
                 <TouchableOpacity
@@ -305,11 +253,11 @@ export default function FormScreen() {
 
           {/* ── Eye Images ── */}
           <View style={s.card}>
-            <Text style={s.sect}>Capture Eye Images</Text>
-            <Text style={s.eyeHint}>Both eyes are required for analysis</Text>
+            <Text style={s.sect}>Capture Eye Image</Text>
+            <Text style={s.eyeHint}>At least one eye image is required</Text>
             <View style={s.eyeRow}>
               {([
-                { side: "left",  label: "LEFT",  img: leftEyeImage,  color: C.purple },
+                { side: "left", label: "LEFT", img: leftEyeImage, color: C.purple },
                 { side: "right", label: "RIGHT", img: rightEyeImage, color: "#c2185b" },
               ] as const).map(({ side, label, img, color }) => (
                 <View key={side} style={s.eyeCol}>
@@ -339,46 +287,9 @@ export default function FormScreen() {
               ))}
             </View>
             <View style={s.statusRow}>
-              <StatusPill ok={!!leftEyeImage}  label="Left eye" />
+              <StatusPill ok={!!leftEyeImage} label="Left eye" />
               <StatusPill ok={!!rightEyeImage} label="Right eye" />
             </View>
-          </View>
-
-          {/* ── Audio Consent ── */}
-          <View style={s.card}>
-            <Text style={s.sect}>Audio Consent</Text>
-            {!audioAvailable ? (
-              <View style={s.audioWarning}>
-                <Icon name="alert-circle-outline" size={18} color="#f59e0b" />
-                <Text style={s.audioWarningText}>
-                  Install expo-av to enable audio consent:{"\n"}
-                  <Text style={{ fontFamily: "monospace" }}>npx expo install expo-av</Text>
-                </Text>
-              </View>
-            ) : (
-              <>
-                <Text style={[s.fieldLabel, { marginBottom: 14 }]}>
-                  Record your verbal consent before submitting
-                </Text>
-                <TouchableOpacity
-                  style={[s.recordBtn, isRecording && s.recordBtnActive]}
-                  onPress={isRecording ? stopRecording : startRecording}
-                >
-                  <Icon name={isRecording ? "stop-circle" : "microphone"} size={24} color="#fff" />
-                  <Text style={s.recordBtnText}>
-                    {isRecording ? "Stop Recording" : "Start Recording"}
-                  </Text>
-                </TouchableOpacity>
-                {audioUri && (
-                  <View style={s.audioSuccess}>
-                    <Icon name="check-circle" size={18} color={C.success} />
-                    <Text style={{ color: C.success, fontSize: 14, fontWeight: "600" }}>
-                      Audio consent recorded
-                    </Text>
-                  </View>
-                )}
-              </>
-            )}
           </View>
 
           {/* ── Submit ── */}
@@ -464,7 +375,7 @@ const s = StyleSheet.create({
     borderBottomWidth: 0.5, borderBottomColor: "#ede7f6",
   },
   headerTitle: { fontSize: 20, fontWeight: "800", color: "#1a1a2e" },
-  headerSub:   { fontSize: 11, color: "#bbb", marginTop: 2 },
+  headerSub: { fontSize: 11, color: "#bbb", marginTop: 2 },
   dashBtn: {
     flexDirection: "row", alignItems: "center", gap: 6,
     backgroundColor: "#f3eefe", borderRadius: 10,
@@ -473,7 +384,7 @@ const s = StyleSheet.create({
   dashBtnText: { color: "#5b2d8e", fontWeight: "700", fontSize: 13 },
 
   progressTrack: { height: 3, backgroundColor: "#d1c4e9" },
-  progressFill:  { height: 3, backgroundColor: "#5b2d8e" },
+  progressFill: { height: 3, backgroundColor: "#5b2d8e" },
 
   scroll: { padding: 16, paddingBottom: 40 },
 
@@ -497,13 +408,13 @@ const s = StyleSheet.create({
     borderRadius: 10, alignItems: "center",
     borderWidth: 1, borderColor: "transparent",
   },
-  genderBtnActive:  { backgroundColor: "#f3eefe", borderColor: "#5b2d8e" },
-  genderText:       { fontWeight: "600", color: "#666", fontSize: 14 },
+  genderBtnActive: { backgroundColor: "#f3eefe", borderColor: "#5b2d8e" },
+  genderText: { fontWeight: "600", color: "#666", fontSize: 14 },
   genderTextActive: { color: "#5b2d8e" },
 
   eyeHint: { fontSize: 13, fontWeight: "600", color: "#1a1a2e", marginBottom: 14 },
-  eyeRow:  { flexDirection: "row", gap: 12, marginBottom: 4 },
-  eyeCol:  { flex: 1 },
+  eyeRow: { flexDirection: "row", gap: 12, marginBottom: 4 },
+  eyeCol: { flex: 1 },
 
   imgBtn: {
     borderRadius: 12, paddingVertical: 14, paddingHorizontal: 10,
@@ -511,40 +422,25 @@ const s = StyleSheet.create({
     flexDirection: "row", justifyContent: "center", gap: 8,
   },
   imgBtnReady: { backgroundColor: "#5b2d8e" },
-  imgBtnDone:  { backgroundColor: "#6c757d" },
-  imgBtnText:  { color: "#fff", fontWeight: "700", fontSize: 13 },
-  imgBtnSub:   { color: "rgba(255,255,255,0.7)", fontSize: 11 },
+  imgBtnDone: { backgroundColor: "#6c757d" },
+  imgBtnText: { color: "#fff", fontWeight: "700", fontSize: 13 },
+  imgBtnSub: { color: "rgba(255,255,255,0.7)", fontSize: 11 },
 
   thumb: {
     marginBottom: 8, borderRadius: 10, overflow: "hidden",
     position: "relative", aspectRatio: 1, width: "100%",
   },
-  thumbImg:       { width: "100%", height: "100%" },
-  thumbBadge:     { position: "absolute", top: 6, left: 6, paddingVertical: 2, paddingHorizontal: 8, borderRadius: 6 },
+  thumbImg: { width: "100%", height: "100%" },
+  thumbBadge: { position: "absolute", top: 6, left: 6, paddingVertical: 2, paddingHorizontal: 8, borderRadius: 6 },
   thumbBadgeText: { color: "#fff", fontWeight: "700", fontSize: 10 },
 
   statusRow: { flexDirection: "row", gap: 8, flexWrap: "wrap", marginTop: 10 },
-  pill:      { paddingVertical: 5, paddingHorizontal: 12, borderRadius: 20 },
-  pillText:  { fontSize: 11, fontWeight: "600" },
+  pill: { paddingVertical: 5, paddingHorizontal: 12, borderRadius: 20 },
+  pillText: { fontSize: 11, fontWeight: "600" },
 
-  audioWarning: {
-    flexDirection: "row", gap: 10, alignItems: "flex-start",
-    backgroundColor: "#fffbeb", borderRadius: 10, padding: 14,
-    borderWidth: 1, borderColor: "#fde68a",
-  },
-  audioWarningText: { flex: 1, fontSize: 13, color: "#92400e", lineHeight: 20 },
-
-  recordBtn: {
-    backgroundColor: "#5b2d8e", padding: 16, borderRadius: 12,
-    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10,
-  },
-  recordBtnActive: { backgroundColor: "#d32f2f" },
-  recordBtnText:   { color: "#fff", fontWeight: "700", fontSize: 15 },
-  audioSuccess: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 12 },
-
-  submitBtn:         { backgroundColor: "#5b2d8e", borderRadius: 16, padding: 18, alignItems: "center", marginBottom: 12 },
+  submitBtn: { backgroundColor: "#5b2d8e", borderRadius: 16, padding: 18, alignItems: "center", marginBottom: 12 },
   submitBtnDisabled: { backgroundColor: "#a07bc4" },
-  submitBtnText:     { color: "#fff", fontWeight: "700", fontSize: 16 },
+  submitBtnText: { color: "#fff", fontWeight: "700", fontSize: 16 },
 
   resetBtn: {
     borderRadius: 14, padding: 14, alignItems: "center",
@@ -555,6 +451,6 @@ const s = StyleSheet.create({
   resetBtnText: { color: "#888", fontWeight: "600", fontSize: 14 },
 
   modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.92)", justifyContent: "center", alignItems: "center" },
-  modalCard:    { alignItems: "center" },
-  modalHint:    { color: "rgba(255,255,255,0.4)", marginTop: 14, fontSize: 13 },
+  modalCard: { alignItems: "center" },
+  modalHint: { color: "rgba(255,255,255,0.4)", marginTop: 14, fontSize: 13 },
 });
