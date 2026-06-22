@@ -37,7 +37,7 @@
     },
     "plugins": [
       "expo-router",
-       "react-native-vision-camera",
+      "react-native-vision-camera",
       [
         "expo-splash-screen",
         {
@@ -66,8 +66,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "3d5075e4-22ed-4209-a57d-dad514400dd3"
+        "projectId": "814d3b30-1328-496a-a002-81ffce98256d"
       }
-    }
+    },
+    "owner": "polakumar"
   }
 }

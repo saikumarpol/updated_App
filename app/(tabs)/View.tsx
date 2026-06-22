@@ -11,9 +11,8 @@ import { useRouter } from "expo-router";
 
 const Icon = MaterialCommunityIcons;
 
-// const BASE_URL = "http://10.2.136.235:5001";
-const BASE_URL = "http://192.168.1.11:5001";
-// const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2/";
+const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2";
+// const BASE_URL = "http://192.168.1.6:5001";
 
 const C = {
   purple: "#5b2d8e",
@@ -33,16 +32,26 @@ const C = {
 const FILTERS = ["All", "Anemic", "Grossly Anemic", "Normal"] as const;
 type Filter = typeof FILTERS[number];
 
+// TODO: revert to leftHb/rightHb average when API Hb values are reliable
+const getDisplayHb = (item: any): string => {
+  if (item.demoHb !== null && item.demoHb !== undefined) {
+    return `${parseFloat(item.demoHb).toFixed(1)} g/dL`;
+  }
+  const left = item.leftHb || 0, right = item.rightHb || 0;
+  if (left === 0 && right === 0) return "—";
+  return `${((left + right) / 2).toFixed(1)} g/dL`;
+};
+
 export default function ViewScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
 
-  const [data, setData]               = useState<any[]>([]);
-  const [filteredData, setFilteredData] = useState<any[]>([]);
-  const [loading, setLoading]         = useState(true);
-  const [refreshing, setRefreshing]   = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [activeFilter, setActiveFilter] = useState<Filter>("All");
+  const [data, setData]                   = useState<any[]>([]);
+  const [filteredData, setFilteredData]   = useState<any[]>([]);
+  const [loading, setLoading]             = useState(true);
+  const [refreshing, setRefreshing]       = useState(false);
+  const [searchQuery, setSearchQuery]     = useState("");
+  const [activeFilter, setActiveFilter]   = useState<Filter>("All");
 
   const fetchData = useCallback(async () => {
     try {
@@ -94,12 +103,6 @@ export default function ViewScreen() {
     return "#adb5bd";
   };
 
-  const calculateAvgHb = (item: any) => {
-    const left = item.leftHb || 0, right = item.rightHb || 0;
-    if (left === 0 && right === 0) return "—";
-    return ((left + right) / 2).toFixed(2);
-  };
-
   const formatDate = (date: string) =>
     new Date(date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 
@@ -124,8 +127,8 @@ export default function ViewScreen() {
 
       <View style={s.statsContainer}>
         <View style={s.hbContainer}>
-          <Text style={s.hbLabel}>Average Hb</Text>
-          <Text style={s.hbValue}>{calculateAvgHb(item)} g/dL</Text>
+          <Text style={s.hbLabel}>Haemoglobin (Hb)</Text>
+          <Text style={s.hbValue}>{getDisplayHb(item)}</Text>
         </View>
         <View style={[s.statusBadge, { backgroundColor: getAnemiaColor(item.anemiaStatus) }]}>
           <Text style={s.statusText}>{item.anemiaStatus || "Unknown"}</Text>
@@ -217,57 +220,34 @@ const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.page },
   center: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: C.page },
   loadingText: { marginTop: 16, fontSize: 16, color: C.muted },
-
-  header: {
-    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
-    paddingHorizontal: 20, paddingVertical: 16, backgroundColor: C.card,
-    borderBottomWidth: 0.5, borderBottomColor: C.border,
-  },
+  header: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 20, paddingVertical: 16, backgroundColor: C.card, borderBottomWidth: 0.5, borderBottomColor: C.border },
   screenTitle: { fontSize: 22, fontWeight: "800", color: C.text },
-  screenSub:   { fontSize: 12, color: C.hint, marginTop: 2 },
-  iconBtn: {
-    width: 40, height: 40, borderRadius: 12,
-    backgroundColor: C.purpleLight, alignItems: "center", justifyContent: "center",
-  },
-
+  screenSub: { fontSize: 12, color: C.hint, marginTop: 2 },
+  iconBtn: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.purpleLight, alignItems: "center", justifyContent: "center" },
   searchWrap: { backgroundColor: C.card, padding: 16, borderBottomWidth: 0.5, borderBottomColor: C.border },
-  searchBox: {
-    flexDirection: "row", alignItems: "center", backgroundColor: C.page,
-    borderRadius: 12, borderWidth: 0.5, borderColor: C.purpleBorder,
-    paddingHorizontal: 12, height: 48, gap: 10,
-  },
+  searchBox: { flexDirection: "row", alignItems: "center", backgroundColor: C.page, borderRadius: 12, borderWidth: 0.5, borderColor: C.purpleBorder, paddingHorizontal: 12, height: 48, gap: 10 },
   searchInput: { flex: 1, fontSize: 15, color: C.text },
-
   filterScroll: { backgroundColor: C.card, borderBottomWidth: 0.5, borderBottomColor: C.border },
   filterRow: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, gap: 10, flexWrap: "wrap" },
   filterChip: { paddingVertical: 6, paddingHorizontal: 16, borderRadius: 20, borderWidth: 0.5, borderColor: C.purpleBorder, backgroundColor: C.card },
   filterChipActive: { backgroundColor: C.purple, borderColor: C.purple },
   filterText: { fontSize: 13, fontWeight: "600", color: C.muted },
   filterTextActive: { color: "#fff" },
-
   listContent: { padding: 16, paddingBottom: 30 },
-
-  card: {
-    backgroundColor: C.card, borderRadius: 16, padding: 16,
-    marginBottom: 14, borderWidth: 0.5, borderColor: C.border,
-  },
+  card: { backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 14, borderWidth: 0.5, borderColor: C.border },
   cardHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start" },
   nameContainer: { flexDirection: "row", gap: 12, flex: 1 },
   nameIcon: { width: 38, height: 38, borderRadius: 10, backgroundColor: C.purpleLight, alignItems: "center", justifyContent: "center" },
   childName: { fontSize: 17, fontWeight: "700", color: C.text },
   childMeta: { fontSize: 12.5, color: C.hint, marginTop: 2 },
   date: { fontSize: 12, color: C.hint },
-
   divider: { height: 0.8, backgroundColor: C.border, marginVertical: 14 },
-
   statsContainer: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   hbContainer: { flex: 1 },
   hbLabel: { fontSize: 12, color: C.muted },
   hbValue: { fontSize: 18, fontWeight: "700", color: C.text, marginTop: 2 },
-
   statusBadge: { paddingVertical: 8, paddingHorizontal: 18, borderRadius: 20, alignSelf: "flex-start" },
   statusText: { color: "#fff", fontWeight: "700", fontSize: 14 },
-
   emptyContainer: { alignItems: "center", paddingTop: 80 },
   emptyText: { marginTop: 16, fontSize: 16, color: "#aaa", textAlign: "center" },
 });

@@ -32,6 +32,7 @@
     "expo-system-ui": "~6.0.9",
     "expo-web-browser": "~15.0.11",
     "jpeg-js": "^0.4.4",
+    "onnxruntime-react-native": "^1.24.3",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
