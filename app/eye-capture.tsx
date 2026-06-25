@@ -1,5 +1,14 @@
+// app/eye-capture.tsx
 import React, { useRef, useState, useCallback, useEffect } from "react";
-import { View, Text, StyleSheet, Dimensions, ActivityIndicator } from "react-native";
+import {
+  View,
+  Text,
+  StyleSheet,
+  Dimensions,
+  ActivityIndicator,
+  TouchableOpacity,
+  Platform,
+} from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import {
   Camera,
@@ -11,19 +20,17 @@ import { InferenceSession, Tensor } from "onnxruntime-react-native";
 import { useResizePlugin } from "vision-camera-resize-plugin";
 import { Worklets } from "react-native-worklets-core";
 import * as ImageManipulator from "expo-image-manipulator";
+import * as Speech from "expo-speech";
+import Svg, { Path, Circle } from "react-native-svg";
 import { Asset } from "expo-asset";
 
-const TAG = "[EyeCapture]";
+const TAG = `[EYE:${Platform.OS}]`;
+const LOG_EVERY_N_FRAMES = 15;
 
 const MODEL_SIZE = 320;
-const NUM_ANCHORS = 3234;
-const CONF_THRESHOLD = 0.75;
-const NMS_IOU_THRESHOLD = 0.35;
+const CONF_THRESHOLD = 0.25;
 const FRAMES_NEEDED = 4;
 const OUTPUT_SIZE = 512;
-
-const VARIANCE_XY = 0.1;
-const VARIANCE_WH = 0.2;
 
 const { width: SW, height: SH } = Dimensions.get("window");
 const GUIDE_SIZE = 220;
@@ -33,7 +40,7 @@ const GUIDE_RIGHT = GUIDE_LEFT + GUIDE_SIZE;
 const GUIDE_BOTTOM = GUIDE_TOP + GUIDE_SIZE;
 const GUIDE_INNER_MARGIN = GUIDE_SIZE * 0.1;
 
-type Box = { x1: number; y1: number; x2: number; y2: number; score: number };
+type Lang = "en" | "hi" | "te";
 
 type DebugEyeBox = {
   left: number;
@@ -44,106 +51,98 @@ type DebugEyeBox = {
   insideGuide: boolean;
 };
 
-// ─── Anchor & Post-processing Functions ─────────────────────────────
-function generateSSDAnchors(): Float32Array {
-  const specs = [
-    { featureMapSize: 20, minScale: 0.1, maxScale: 0.2, aspectRatios: [2, 3] },
-    { featureMapSize: 10, minScale: 0.2, maxScale: 0.375, aspectRatios: [2, 3] },
-    { featureMapSize: 5, minScale: 0.375, maxScale: 0.55, aspectRatios: [2, 3] },
-    { featureMapSize: 3, minScale: 0.55, maxScale: 0.725, aspectRatios: [2, 3] },
-    { featureMapSize: 2, minScale: 0.725, maxScale: 0.9, aspectRatios: [2, 3] },
-    { featureMapSize: 1, minScale: 0.9, maxScale: 1.075, aspectRatios: [2, 3] },
-  ];
-
-  const anchors: number[] = [];
-  for (const spec of specs) {
-    const { featureMapSize: fms, minScale, maxScale, aspectRatios } = spec;
-    const step = 1.0 / fms;
-    for (let row = 0; row < fms; row++) {
-      for (let col = 0; col < fms; col++) {
-        const cx = (col + 0.5) * step;
-        const cy = (row + 0.5) * step;
-
-        anchors.push(cy, cx, minScale, minScale);
-        const interpScale = Math.sqrt(minScale * maxScale);
-        anchors.push(cy, cx, interpScale, interpScale);
-
-        for (const ar of aspectRatios) {
-          const sqrtAr = Math.sqrt(ar);
-          anchors.push(cy, cx, minScale * sqrtAr, minScale / sqrtAr);
-          anchors.push(cy, cx, minScale / sqrtAr, minScale * sqrtAr);
-        }
-      }
-    }
-  }
-
-  const out = new Float32Array(NUM_ANCHORS * 4);
-  for (let i = 0; i < anchors.length; i++) out[i] = anchors[i];
-  return out;
-}
-
-function decodeSSDBox(
-  dy: number,
-  dx: number,
-  dh: number,
-  dw: number,
-  acy: number,
-  acx: number,
-  ah: number,
-  aw: number,
-) {
-  const cy = dy * VARIANCE_XY * ah + acy;
-  const cx = dx * VARIANCE_XY * aw + acx;
-  const h = Math.exp(dh * VARIANCE_WH) * ah;
-  const w = Math.exp(dw * VARIANCE_WH) * aw;
-  return { x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2 };
-}
-
-function sigmoid(x: number) {
-  return 1 / (1 + Math.exp(-x));
-}
-
-function iou(a: Box, b: Box) {
-  const ix1 = Math.max(a.x1, b.x1);
-  const iy1 = Math.max(a.y1, b.y1);
-  const ix2 = Math.min(a.x2, b.x2);
-  const iy2 = Math.min(a.y2, b.y2);
-  const iw = Math.max(0, ix2 - ix1);
-  const ih = Math.max(0, iy2 - iy1);
-  const inter = iw * ih;
-  const areaA = Math.max(0, a.x2 - a.x1) * Math.max(0, a.y2 - a.y1);
-  const areaB = Math.max(0, b.x2 - b.x1) * Math.max(0, b.y2 - b.y1);
-  return inter / (areaA + areaB - inter + 1e-6);
-}
-
-function nms(boxes: Box[], threshold: number) {
-  const sorted = [...boxes].sort((a, b) => b.score - a.score);
-  const kept: Box[] = [];
-  while (sorted.length) {
-    const current = sorted.shift()!;
-    kept.push(current);
-    for (let i = sorted.length - 1; i >= 0; i--) {
-      if (iou(current, sorted[i]) > threshold) sorted.splice(i, 1);
-    }
-  }
-  return kept;
-}
-
-function modelToScreen(nx: number, ny: number) {
-  return {
-    sx: GUIDE_LEFT + nx * GUIDE_SIZE,
-    sy: GUIDE_TOP + ny * GUIDE_SIZE,
-  };
-}
+// ── Coordinate helpers ────────────────────────────────────────────
 
 function getEyeBoxOnScreen(x1: number, y1: number, x2: number, y2: number) {
-  const { sx: l1, sy: t1 } = modelToScreen(Math.min(x1, x2), Math.min(y1, y2));
-  const { sx: l2, sy: t2 } = modelToScreen(Math.max(x1, x2), Math.max(y1, y2));
-  return { left: l1, top: t1, right: l2, bottom: t2, width: l2 - l1, height: t2 - t1 };
+  "worklet";
+  const left   = (Math.min(x1, x2) / MODEL_SIZE) * SW;
+  const top    = (Math.min(y1, y2) / MODEL_SIZE) * SH;
+  const right  = (Math.max(x1, x2) / MODEL_SIZE) * SW;
+  const bottom = (Math.max(y1, y2) / MODEL_SIZE) * SH;
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
 }
 
-const ANCHORS = generateSSDAnchors();
+function checkEyeWithinGuideBox(x1: number, y1: number, x2: number, y2: number) {
+  "worklet";
+  // Model outputs a large near-full-frame box; requiring the whole box
+  // to fit inside the guide will always fail. Check center point instead.
+  const cx = ((x1 + x2) / 2 / MODEL_SIZE) * SW;
+  const cy = ((y1 + y2) / 2 / MODEL_SIZE) * SH;
 
+  const innerLeft   = GUIDE_LEFT   + GUIDE_INNER_MARGIN;
+  const innerTop    = GUIDE_TOP    + GUIDE_INNER_MARGIN;
+  const innerRight  = GUIDE_RIGHT  - GUIDE_INNER_MARGIN;
+  const innerBottom = GUIDE_BOTTOM - GUIDE_INNER_MARGIN;
+
+  return (
+    cx >= innerLeft  &&
+    cx <= innerRight &&
+    cy >= innerTop   &&
+    cy <= innerBottom
+  );
+}
+
+function getResizeRotation(
+  orientation: string,
+): "0deg" | "90deg" | "180deg" | "270deg" {
+  "worklet";
+  if (Platform.OS === "android") return "270deg";
+  switch (orientation) {
+    case "landscape-right":       return "90deg";
+    case "landscape-left":        return "270deg";
+    case "portrait-upside-down":  return "180deg";
+    case "portrait":
+    default:                      return "90deg";
+  }
+}
+
+// ── Voice ─────────────────────────────────────────────────────────
+
+const VOICE: Record<string, Record<Lang, { text: string; bcp47: string }>> = {
+  alignFace: {
+    en: { text: "Pull down your lower eyelid and fill the box with the pink area.", bcp47: "en-IN" },
+    hi: { text: "निचली पलक को नीचे खींचें और गुलाबी हिस्से से बॉक्स भरें।", bcp47: "hi-IN" },
+    te: { text: "కింది రెప్పను కిందకు లాగి, గులాబీ భాగంతో బాక్స్ నింపండి.", bcp47: "te-IN" },
+  },
+  allGood: {
+    en: { text: "Good! Capturing now.", bcp47: "en-IN" },
+    hi: { text: "बढ़िया! अभी कैप्चर हो रहा है।", bcp47: "hi-IN" },
+    te: { text: "బాగుంది! ఇప్పుడు క్యాప్చర్ అవుతోంది.", bcp47: "te-IN" },
+  },
+};
+
+// ── Icons ─────────────────────────────────────────────────────────
+
+const IconEye = ({ size = 24, color = "#fff" }) => (
+  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <Path
+      d="M1 12C1 12 5 5 12 5C19 5 23 12 23 12C23 12 19 19 12 19C5 19 1 12 1 12Z"
+      stroke={color} strokeWidth="2" strokeLinejoin="round"
+    />
+    <Circle cx="12" cy="12" r="3.5" stroke={color} strokeWidth="2" />
+  </Svg>
+);
+
+const IconSpeaker = ({ size = 22, color = "#fff" }) => (
+  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <Path
+      d="M11 5L6 9H3C2.45 9 2 9.45 2 10V14C2 14.55 2.45 15 3 15H6L11 19V5Z"
+      stroke={color} strokeWidth="2" strokeLinejoin="round"
+    />
+    <Path
+      d="M15.54 8.46C16.48 9.4 17 10.67 17 12C17 13.33 16.48 14.6 15.54 15.54"
+      stroke={color} strokeWidth="2" strokeLinecap="round"
+    />
+    <Path
+      d="M19.07 4.93C20.96 6.82 22 9.35 22 12C22 14.65 20.96 17.18 19.07 19.07"
+      stroke={color} strokeWidth="2" strokeLinecap="round"
+    />
+  </Svg>
+);
+
+// ─────────────────────────────────────────────────────────────────
+//  COMPONENT
+// ─────────────────────────────────────────────────────────────────
 export default function EyeCaptureScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{
@@ -154,108 +153,100 @@ export default function EyeCaptureScreen() {
     age?: string;
     gender?: string;
     eyeSessionId?: string;
+    leftEyeImage?: string;
+    rightEyeImage?: string;
   }>();
 
-  const eyeSide = params.eyeSide ?? "right";
+  const { eyeSide = "right" } = params;
 
   const cameraRef = useRef<Camera>(null);
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice("front");
-  const { resize } = useResizePlugin();
-
-  const sessionRef = useRef<InferenceSession | null>(null);
-  const modelReadyRef = useRef(false);
-  const cameraReadyRef = useRef(false);
-  const capturingRef = useRef(false);
-  const inferenceInFlightRef = useRef(false);
-  const consecutiveRef = useRef(0);
-  const frameSkipRef = useRef(0);
 
   const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
-  const [detected, setDetected] = useState(false);
-  const [score, setScore] = useState(0);
-  const [frameCount, setFrameCount] = useState(0);
-  const [statusMsg, setStatusMsg] = useState("Position eye in the box");
-  const [capturing, setCapturing] = useState(false);
-  const [debugEyeBox, setDebugEyeBox] = useState<DebugEyeBox | null>(null);
+  const sessionRef = useRef<InferenceSession | null>(null);
 
-  const setDetectedJS = Worklets.createRunOnJS(setDetected);
-  const setScoreJS = Worklets.createRunOnJS(setScore);
-  const setFrameCountJS = Worklets.createRunOnJS(setFrameCount);
-  const setStatusMsgJS = Worklets.createRunOnJS(setStatusMsg);
-  const setDebugEyeBoxJS = Worklets.createRunOnJS(setDebugEyeBox);
-
-  // Load ONNX Model
+  // ── Load ONNX model ───────────────────────────────────────────
   useEffect(() => {
-    let mounted = true;
+    let cancelled = false;
     (async () => {
       try {
-        const [asset] = await Asset.loadAsync(require("../assets/model/mobilenet.onnx"));
-        if (!asset.localUri) throw new Error("Model localUri missing");
-
-        const modelPath = asset.localUri.replace(/^file:\/\//, "");
-        const session = await InferenceSession.create(modelPath, {
-          executionProviders: ["coreml", "cpu"],
-        });
-
-        if (!mounted) return;
-        sessionRef.current = session;
-        modelReadyRef.current = true;
-        setModelState("ready");
-      } catch (err) {
-        console.error(TAG, "Model loading failed", err);
-        if (mounted) setModelState("error");
+        const [asset] = await Asset.loadAsync(
+          require("../assets/model/2026-06-24__mnv3ssd-320-best-model-with-postprocess.onnx"),
+        );
+        if (!asset.localUri) throw new Error("Asset failed to resolve to a local URI");
+        const modelPath = asset.localUri.replace("file://", "");
+        console.log(`${TAG} 📦 model path: ${modelPath}`);
+        const s = await InferenceSession.create(modelPath);
+        if (!cancelled) {
+          sessionRef.current = s;
+          setModelState("ready");
+          console.log(`${TAG} ✅ ONNX loaded. inputs=${s.inputNames} outputs=${s.outputNames}`);
+        }
+      } catch (err: any) {
+        if (!cancelled) {
+          console.error(`${TAG} ❌ ONNX load failed:`, err?.message ?? String(err));
+          setModelState("error");
+        }
       }
     })();
-
-    return () => {
-      mounted = false;
-    };
+    return () => { cancelled = true; };
   }, []);
 
-  const checkEyeInsideGuide = (box: Box) => {
-    const screen = getEyeBoxOnScreen(box.x1, box.y1, box.x2, box.y2);
-    const innerLeft = GUIDE_LEFT + GUIDE_INNER_MARGIN;
-    const innerTop = GUIDE_TOP + GUIDE_INNER_MARGIN;
-    const innerRight = GUIDE_RIGHT - GUIDE_INNER_MARGIN;
-    const innerBottom = GUIDE_BOTTOM - GUIDE_INNER_MARGIN;
+  const { resize } = useResizePlugin();
 
-    const cx = (screen.left + screen.right) / 2;
-    const cy = (screen.top + screen.bottom) / 2;
-    const w = screen.width;
-    const h = screen.height;
-    const aspect = w / Math.max(h, 1e-6);
+  // ── UI state ──────────────────────────────────────────────────
+  const [detected,    setDetected]    = useState(false);
+  const [score,       setScore]       = useState(0);
+  const [frameCount,  setFrameCount]  = useState(0);
+  const [statusMsg,   setStatusMsg]   = useState("Position eye in the box");
+  const [capturing,   setCapturing]   = useState(false);
+  const [debugEyeBox, setDebugEyeBox] = useState<DebugEyeBox | null>(null);
+  const [inferMs,     setInferMs]     = useState(0);   // ← inference timing
 
-    return (
-      cx >= innerLeft && cx <= innerRight &&
-      cy >= innerTop && cy <= innerBottom &&
-      w > 20 && h > 20 &&
-      w < GUIDE_SIZE * 0.9 && h < GUIDE_SIZE * 0.9 &&
-      aspect > 0.5 && aspect < 2.5
-    );
-  };
+  const [lang,        setLang]        = useState<Lang>("en");
+  const [isSpeaking,  setIsSpeaking]  = useState(false);
 
-  // ─── Improved Capture & Navigate (Same as TFLite version) ─────────────────
+  const cameraReadyRef    = useRef(false);
+  const capturingRef      = useRef(false);
+  const consecutiveRef    = useRef(0);
+  const frameLogCounterRef = useRef(0);
+  const lastSpokenKey     = useRef<string | null>(null);
+  const lastSpokenTime    = useRef<number>(0);
+
+  // Worklet → JS bridges
+  const setDetectedJS   = Worklets.createRunOnJS(setDetected);
+  const setScoreJS      = Worklets.createRunOnJS(setScore);
+  const setFrameCountJS = Worklets.createRunOnJS(setFrameCount);
+  const setStatusMsgJS  = Worklets.createRunOnJS(setStatusMsg);
+  const setDebugEyeBoxJS = Worklets.createRunOnJS(setDebugEyeBox);
+  const setInferMsJS    = Worklets.createRunOnJS(setInferMs);
+
+  useEffect(() => () => Speech.stop(), []);
+
+  // ── Capture & navigate ────────────────────────────────────────
   const captureAndNavigate = useCallback(async () => {
     if (capturingRef.current) return;
-
     const camera = cameraRef.current;
-    if (!cameraReadyRef.current || !camera) return;
+    if (!cameraReadyRef.current || !camera) {
+      console.warn(`${TAG} ⚠️ capture blocked — camera not ready`);
+      return;
+    }
 
     capturingRef.current = true;
     setCapturing(true);
-    setStatusMsg("Capturing high-quality image...");
+    setStatusMsg("Capturing…");
 
     try {
       const photo = await camera.takeSnapshot({ quality: 95 });
       const photoUri = photo.path.startsWith("file://") ? photo.path : `file://${photo.path}`;
 
-      const scaleX = photo.width / SW;
+      const scaleX = photo.width  / SW;
       const scaleY = photo.height / SH;
 
       const cropX = Math.max(0, Math.round(GUIDE_LEFT * scaleX));
-      const cropY = Math.max(0, Math.round(GUIDE_TOP * scaleY));
-      const cropW = Math.min(Math.round(GUIDE_SIZE * scaleX), photo.width - cropX);
+      const cropY = Math.max(0, Math.round(GUIDE_TOP  * scaleY));
+      const cropW = Math.min(Math.round(GUIDE_SIZE * scaleX), photo.width  - cropX);
       const cropH = Math.min(Math.round(GUIDE_SIZE * scaleY), photo.height - cropY);
 
       const manipulated = await ImageManipulator.manipulateAsync(
@@ -264,207 +255,265 @@ export default function EyeCaptureScreen() {
           { crop: { originX: cropX, originY: cropY, width: cropW, height: cropH } },
           { resize: { width: OUTPUT_SIZE, height: OUTPUT_SIZE } },
         ],
-        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG }
+        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
       );
 
-      if (!eyeSide) {
-        console.error("[EyeCapture] ❌ eyeSide is missing!");
-        router.back();
-        return;
-      }
-
-      const imageKey = eyeSide === "left" ? "leftEyeImage" : "rightEyeImage";
+      console.log(`${TAG} ✅ Captured ${eyeSide} eye: ${manipulated.uri}`);
 
       router.replace({
         pathname: "/",
         params: {
-          [imageKey]: manipulated.uri,
-          name: params.name,
-          parentName: params.parentName,
-          phoneNumber: params.phoneNumber,
-          age: params.age,
-          gender: params.gender,
-          eyeSessionId: params.eyeSessionId,
+          eyeImage:      manipulated.uri,
+          eyeSide:       eyeSide,
+          leftEyeImage:  eyeSide === "left"  ? manipulated.uri : (params.leftEyeImage  ?? ""),
+          rightEyeImage: eyeSide === "right" ? manipulated.uri : (params.rightEyeImage ?? ""),
+          name:          params.name,
+          parentName:    params.parentName,
+          phoneNumber:   params.phoneNumber,
+          age:           params.age,
+          gender:        params.gender,
+          eyeSessionId:  params.eyeSessionId,
         },
       });
     } catch (err: any) {
-      console.error("[EyeCapture] ❌ CAPTURE FAILED:", err.message);
-      setStatusMsg("Capture failed – please try again");
+      console.error(`${TAG} ❌ CAPTURE FAILED:`, err);
+      setStatusMsg("Capture failed — try again");
     } finally {
       setCapturing(false);
       capturingRef.current = false;
     }
-  }, [eyeSide, params, router]);
+  }, [router, eyeSide, params]);
 
   const triggerCaptureJS = Worklets.createRunOnJS(captureAndNavigate);
 
-  // Rest of your inference logic remains the same...
-  const runInference = useCallback(async (chwArray: number[]) => {
-    const session = sessionRef.current;
-    if (!session) return null;
+  // ── ONNX inference (JS thread) ────────────────────────────────
+  const runOnnxDetection = Worklets.createRunOnJS(
+    async (hwcBuffer: Float32Array) => {
+      const s = sessionRef.current;
+      if (!s || capturingRef.current) return;
 
-    const chw = new Float32Array(chwArray);
-    const inputTensor = new Tensor("float32", chw, [1, 3, MODEL_SIZE, MODEL_SIZE]);
-    const results = await session.run({ input: inputTensor });
+      try {
+        // HWC → CHW transpose
+        const chw = new Float32Array(3 * MODEL_SIZE * MODEL_SIZE);
+        const px  = MODEL_SIZE * MODEL_SIZE;
+        for (let i = 0; i < px; i++) {
+          chw[i]          = hwcBuffer[i * 3];
+          chw[i + px]     = hwcBuffer[i * 3 + 1];
+          chw[i + px * 2] = hwcBuffer[i * 3 + 2];
+        }
 
-    const clsData = results["cls_logits"]?.data as Float32Array | undefined;
-    const bboxData = results["bbox_regression"]?.data as Float32Array | undefined;
-    if (!clsData || !bboxData) return null;
+        const inputTensor = new Tensor("float32", chw, [1, 3, MODEL_SIZE, MODEL_SIZE]);
 
-    const candidates: Box[] = [];
-    for (let i = 0; i < NUM_ANCHORS; i++) {
-      const conf = sigmoid(clsData[i * 2 + 1]);
-      if (conf < CONF_THRESHOLD) continue;
+        // ── Inference timing ──────────────────────────────────
+        const t0 = performance.now();
+        const results = await s.run({ input: inputTensor });
+        const inferenceMs = performance.now() - t0;
+        setInferMsJS(Math.round(inferenceMs));
+        console.log(`${TAG} ⏱ inference: ${inferenceMs.toFixed(1)} ms`);
+        // ──────────────────────────────────────────────────────
 
-      const dy = bboxData[i * 4 + 0];
-      const dx = bboxData[i * 4 + 1];
-      const dh = bboxData[i * 4 + 2];
-      const dw = bboxData[i * 4 + 3];
+        const detTensor = results["detections"];
 
-      const acy = ANCHORS[i * 4 + 0];
-      const acx = ANCHORS[i * 4 + 1];
-      const ah = ANCHORS[i * 4 + 2];
-      const aw = ANCHORS[i * 4 + 3];
+        if (!detTensor) {
+          console.warn(`${TAG} ⚠️ no "detections" output`);
+          setDetectedJS(false);
+          setScoreJS(0);
+          setDebugEyeBoxJS(null);
+          setStatusMsgJS("No eye detected");
+          consecutiveRef.current = 0;
+          setFrameCountJS(0);
+          return;
+        }
 
-      const box = decodeSSDBox(dy, dx, dh, dw, acy, acx, ah, aw);
-      candidates.push({ ...box, score: conf });
-    }
+        const raw           = detTensor.data as Float32Array;
+        const numDetections = raw.length / 6;
 
-    if (candidates.length === 0) return null;
-    return nms(candidates, NMS_IOU_THRESHOLD)[0] ?? null;
-  }, []);
-
-  const handleInferenceResult = useCallback((box: Box | null) => {
-    if (!box) {
-      setScoreJS(0);
-      setDetectedJS(false);
-      setFrameCountJS(0);
-      setStatusMsgJS("Position eye in the box");
-      setDebugEyeBoxJS(null);
-      consecutiveRef.current = 0;
-      return;
-    }
-
-    setScoreJS(box.score);
-    const inside = checkEyeInsideGuide(box);
-    const screen = getEyeBoxOnScreen(box.x1, box.y1, box.x2, box.y2);
-
-    setDebugEyeBoxJS({
-      left: screen.left,
-      top: screen.top,
-      width: screen.width,
-      height: screen.height,
-      score: box.score,
-      insideGuide: inside,
-    });
-
-    if (inside) {
-      consecutiveRef.current += 1;
-      setDetectedJS(true);
-      setFrameCountJS(consecutiveRef.current);
-
-      if (consecutiveRef.current >= FRAMES_NEEDED) {
-        consecutiveRef.current = 0;
-        triggerCaptureJS();
-      } else {
-        setStatusMsgJS(`Hold still... ${consecutiveRef.current}/${FRAMES_NEEDED}`);
-      }
-    } else {
-      consecutiveRef.current = 0;
-      setDetectedJS(false);
-      setFrameCountJS(0);
-      setStatusMsgJS(box.score >= CONF_THRESHOLD ? "Keep full eye inside the box" : "Position eye in the box");
-    }
-  }, [triggerCaptureJS]);
-
-  const runInferenceFromFrame = Worklets.createRunOnJS(async (chwArray: number[]) => {
-    if (inferenceInFlightRef.current) return;
-    inferenceInFlightRef.current = true;
-    try {
-      const result = await runInference(chwArray);
-      handleInferenceResult(result);
-    } finally {
-      inferenceInFlightRef.current = false;
-    }
-  });
-
-  const frameProcessor = useFrameProcessor((frame) => {
-    "worklet";
-    if (!modelReadyRef.current) return;
-    if (capturingRef.current) return;
-
-    frameSkipRef.current += 1;
-    if (frameSkipRef.current % 2 !== 0) return;
-
-    try {
-      const resizedHWC = resize(frame, {
-        scale: { width: MODEL_SIZE, height: MODEL_SIZE },
-        pixelFormat: "rgb",
-        dataType: "float32",
-        rotation: "270deg",
-      });
-
-      const H = MODEL_SIZE;
-      const W = MODEL_SIZE;
-      const C = 3;
-      const chw: number[] = new Array(C * H * W);
-
-      for (let ch = 0; ch < C; ch++) {
-        for (let row = 0; row < H; row++) {
-          for (let col = 0; col < W; col++) {
-            chw[ch * H * W + row * W + col] =
-              resizedHWC[row * W * C + col * C + ch];
+        let bestScore = 0, bestX1 = 0, bestY1 = 0, bestX2 = 0, bestY2 = 0;
+        for (let i = 0; i < numDetections; i++) {
+          const o = i * 6;
+          if (raw[o + 4] > bestScore) {
+            bestScore = raw[o + 4];
+            bestX1 = raw[o];  bestY1 = raw[o + 1];
+            bestX2 = raw[o + 2]; bestY2 = raw[o + 3];
           }
         }
+
+        console.log(
+          `${TAG} detection score=${bestScore.toFixed(3)} box=[${bestX1.toFixed(1)},${bestY1.toFixed(1)},${bestX2.toFixed(1)},${bestY2.toFixed(1)}]`,
+        );
+
+        setScoreJS(bestScore);
+
+        if (bestScore < CONF_THRESHOLD) {
+          setDetectedJS(false);
+          setDebugEyeBoxJS(null);
+          setStatusMsgJS("Position eye in the box");
+          consecutiveRef.current = 0;
+          setFrameCountJS(0);
+          return;
+        }
+
+        const box          = getEyeBoxOnScreen(bestX1, bestY1, bestX2, bestY2);
+        const insideGuide  = checkEyeWithinGuideBox(bestX1, bestY1, bestX2, bestY2);
+
+        setDebugEyeBoxJS({
+          left: box.left, top: box.top,
+          width: box.width, height: box.height,
+          score: bestScore, insideGuide,
+        });
+
+        if (insideGuide) {
+          consecutiveRef.current += 1;
+          setDetectedJS(true);
+          setFrameCountJS(consecutiveRef.current);
+
+          if (consecutiveRef.current >= FRAMES_NEEDED) {
+            console.log(`${TAG} 🎯 triggering capture (${FRAMES_NEEDED} frames held)`);
+            consecutiveRef.current = 0;
+            triggerCaptureJS();
+          } else {
+            setStatusMsgJS(`Hold still… ${consecutiveRef.current}/${FRAMES_NEEDED}`);
+          }
+        } else {
+          consecutiveRef.current = 0;
+          setDetectedJS(false);
+          setFrameCountJS(0);
+          setStatusMsgJS("Move eye into the box");
+        }
+      } catch (err: any) {
+        console.error(`${TAG} ❌ ONNX inference failed:`, err?.message ?? String(err));
+      }
+    },
+  );
+
+  // ── Frame processor ───────────────────────────────────────────
+  const frameProcessor = useFrameProcessor(
+    (frame) => {
+      "worklet";
+
+      frameLogCounterRef.current += 1;
+      const shouldLog = frameLogCounterRef.current % LOG_EVERY_N_FRAMES === 0;
+
+      if (!sessionRef.current) {
+        if (shouldLog) console.log(`${TAG} ⏳ session not ready — frame ${frameLogCounterRef.current}`);
+        return;
+      }
+      if (capturingRef.current) return;
+
+      const rotation = getResizeRotation(frame.orientation);
+
+      if (shouldLog) {
+        console.log(
+          `${TAG} frame w=${frame.width} h=${frame.height} orientation=${frame.orientation} rotation=${rotation}`,
+        );
       }
 
-      runInferenceFromFrame(chw);
-    } catch {}
-  }, [resize, runInferenceFromFrame]);
+      let resized: Float32Array;
+      try {
+        resized = resize(frame, {
+          scale: { width: MODEL_SIZE, height: MODEL_SIZE },
+          pixelFormat: "rgb",
+          dataType: "float32",
+          rotation,
+        }) as Float32Array;
+      } catch (err: any) {
+        console.error(`${TAG} ❌ resize failed:`, err?.message ?? String(err));
+        return;
+      }
 
-  // ─── UI Rendering ─────────────────────────────────────────────────
+      runOnnxDetection(resized);
+    },
+    [sessionRef],
+  );
+
+  // ── Voice guidance ────────────────────────────────────────────
+  const speakNow = useCallback(
+    (key: string, l: Lang = lang) => {
+      const entry = VOICE[key]?.[l];
+      if (!entry) return;
+      Speech.stop();
+      setIsSpeaking(true);
+      Speech.speak(entry.text, {
+        language: entry.bcp47,
+        rate: 1.0,
+        pitch: 1.0,
+        onDone:  () => setIsSpeaking(false),
+        onError: () => setIsSpeaking(false),
+      });
+    },
+    [lang],
+  );
+
+  const problemKey = detected ? "allGood" : "alignFace";
+  const instrText  = VOICE[problemKey]?.[lang]?.text ?? "";
+
+  useEffect(() => {
+    const now = Date.now();
+    if (
+      problemKey !== lastSpokenKey.current ||
+      now - lastSpokenTime.current > 8000
+    ) {
+      lastSpokenKey.current  = problemKey;
+      lastSpokenTime.current = now;
+      speakNow(problemKey, lang);
+    }
+  }, [problemKey, lang, speakNow]);
+
+  // ── Guards ────────────────────────────────────────────────────
   if (!hasPermission) {
     return (
       <View style={s.center}>
-        <Text style={s.permText} onPress={requestPermission}>
+        <Text style={s.permText} onPress={async () => { await requestPermission(); }}>
           Tap to grant camera permission
         </Text>
       </View>
     );
   }
-
   if (!device) {
+    return <View style={s.center}><Text style={s.label}>No front camera found</Text></View>;
+  }
+  if (modelState === "loading") {
     return (
       <View style={s.center}>
-        <Text style={s.label}>No front camera found</Text>
+        <ActivityIndicator size="large" color="#00c853" />
+        <Text style={[s.permText, { marginTop: 14 }]}>Loading model…</Text>
       </View>
     );
   }
-
   if (modelState === "error") {
     return (
       <View style={s.center}>
-        <Text style={[s.label, { color: "#ff5252", textAlign: "center", paddingHorizontal: 24 }]}>
-          Failed to load detection model.{"\n"}Please restart the app.
-        </Text>
+        <Text style={[s.permText, { color: "#ff5555" }]}>❌ Model failed to load</Text>
       </View>
     );
   }
 
-  const progressPct = Math.round((frameCount / FRAMES_NEEDED) * 100);
+  // ── Derived UI ────────────────────────────────────────────────
+  const progressPct = Math.min(100, Math.round((frameCount / FRAMES_NEEDED) * 100));
+  const guideColor  = capturing ? "#ffeb3b" : detected ? "#00ff66" : "#4c9fff";
+
+  let captureBtnLabel = "Align eye…";
+  if (capturing)  captureBtnLabel = "Capturing…";
+  else if (detected) captureBtnLabel = `📸 Auto-capturing… ${frameCount}/${FRAMES_NEEDED}`;
 
   return (
     <View style={s.root}>
+
+      {/* Camera */}
       <Camera
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={!capturing}
         frameProcessor={frameProcessor}
-        onInitialized={() => (cameraReadyRef.current = true)}
-        onError={() => {
+        onInitialized={() => {
+          cameraReadyRef.current = true;
+          console.log(`${TAG} ✅ camera initialized`);
+        }}
+        onError={(error) => {
           cameraReadyRef.current = false;
-          setStatusMsg("Camera error");
+          console.error(`${TAG} ❌ camera error:`, error?.message ?? String(error));
+          setStatusMsg("Camera error — try again");
         }}
         photo
       />
@@ -475,141 +524,223 @@ export default function EyeCaptureScreen() {
       <View style={[s.vig, { top: GUIDE_TOP, left: 0, width: GUIDE_LEFT, height: GUIDE_SIZE }]} />
       <View style={[s.vig, { top: GUIDE_TOP, left: GUIDE_LEFT + GUIDE_SIZE, right: 0, height: GUIDE_SIZE }]} />
 
-      <View style={[s.guide, detected && !capturing && s.guideDetected, capturing && s.guideCapturing]} />
+      {/* Guide box */}
+      <View style={[s.guide, { borderColor: guideColor, borderStyle: detected ? "solid" : "dashed" }]}>
+        {(["TL", "TR", "BL", "BR"] as const).map((c) => (
+          <View key={c} style={[s.corner, (s as any)[`corner${c}`], { borderColor: guideColor }]} />
+        ))}
+        <View style={s.verticalLine} />
+        <View style={s.horizontalLine} />
+        <View style={[s.centerDot, { borderColor: guideColor }]} />
+      </View>
 
+      {/* Debug eye box overlay */}
       {debugEyeBox && (
         <View
           pointerEvents="none"
           style={[
             s.debugEyeBox,
             debugEyeBox.insideGuide ? s.debugEyeBoxInside : s.debugEyeBoxOutside,
-            {
-              left: debugEyeBox.left,
-              top: debugEyeBox.top,
-              width: debugEyeBox.width,
-              height: debugEyeBox.height,
-            },
+            { left: debugEyeBox.left, top: debugEyeBox.top, width: debugEyeBox.width, height: debugEyeBox.height },
           ]}
         >
-          <Text
-            style={[
-              s.debugEyeBoxLabel,
-              debugEyeBox.insideGuide ? s.debugEyeBoxLabelInside : s.debugEyeBoxLabelOutside,
-            ]}
-          >
-            {debugEyeBox.insideGuide ? "IN" : "OUT"} {debugEyeBox.score.toFixed(2)}
+          <Text style={[s.debugEyeBoxLabel, debugEyeBox.insideGuide ? s.debugLabelInside : s.debugLabelOutside]}>
+            {debugEyeBox.insideGuide ? "IN" : "OUT"} {(debugEyeBox.score * 100).toFixed(0)}%
           </Text>
         </View>
       )}
 
-      <View style={s.topLabel}>
-        <Text style={s.eyeTitle}>EYE DETECTION</Text>
-        <Text style={s.eyeSub}>Centre your {eyeSide.toUpperCase()} eye inside the box</Text>
-      </View>
-
+      {/* Progress bar */}
       <View style={s.progressTrack}>
-        <View style={[s.progressFill, { width: `${progressPct}%` }]} />
+        <View style={[s.progressFill, { width: `${progressPct}%`, backgroundColor: guideColor }]} />
       </View>
 
-      <View style={s.hud}>
-        {capturing ? (
-          <View style={s.row}>
-            <ActivityIndicator color="#fff" size="small" />
-            <Text style={s.hudText}> Processing image...</Text>
+      {/* Top panel */}
+      <View style={s.topPanel}>
+        <View style={s.controlRow}>
+          <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
+            <Text style={s.backBtnText}>← Back</Text>
+          </TouchableOpacity>
+
+          <View style={s.sideLabel}>
+            <Text style={s.sideLabelText}>{eyeSide.toUpperCase()} EYE</Text>
           </View>
-        ) : (
-          <>
-            <Text style={[s.statusText, detected ? s.statusGreen : s.statusGray]}>
-              {statusMsg}
-            </Text>
-            <View style={s.row}>
-              <HudPill label="Side" value={eyeSide.toUpperCase()} />
-              <HudPill label="Model" value={modelState} />
-              <HudPill label="Score" value={score.toFixed(3)} />
-              <HudPill label="Frames" value={`${frameCount}/${FRAMES_NEEDED}`} />
+
+          <View style={s.radioGroup}>
+            {(["en", "hi", "te"] as Lang[]).map((l, idx) => (
+              <TouchableOpacity
+                key={l}
+                style={[
+                  s.radioBtn,
+                  idx === 0 && s.radioBtnFirst,
+                  idx === 2 && s.radioBtnLast,
+                  lang === l && s.radioBtnActive,
+                ]}
+                onPress={() => setLang(l)}
+              >
+                <Text style={[s.radioLabel, lang === l && s.radioLabelActive]}>
+                  {l === "en" ? "EN" : l === "hi" ? "हि" : "తె"}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        {/* Status pill */}
+        <View style={[s.statusPill, { borderColor: guideColor }]}>
+          <IconEye size={16} color={guideColor} />
+          <Text style={[s.statusText, { color: guideColor }]}>{statusMsg}</Text>
+        </View>
+
+        {/* Voice instruction */}
+        <View style={[s.instrBox, { borderColor: detected ? "#00e676" : "rgba(255,255,255,0.15)" }]}>
+          {isSpeaking && (
+            <View style={s.speakingDot}>
+              <View style={[s.speakingPulse, { backgroundColor: detected ? "#00e676" : "#f4a97f" }]} />
             </View>
-          </>
-        )}
+          )}
+          <Text style={[s.instrText, { color: detected ? "#00e676" : "#fff" }]}>{instrText}</Text>
+          <TouchableOpacity style={s.speakBtn} onPress={() => speakNow(problemKey)}>
+            <IconSpeaker size={20} color={detected ? "#00e676" : "#fff"} />
+          </TouchableOpacity>
+        </View>
+
+        <View style={s.hintBox}>
+          <Text style={s.hintText}>📱 Hold 10–15 cm • Pull lower eyelid down • Fill the guide box</Text>
+        </View>
+      </View>
+
+      {/* Bottom debug + capture */}
+      <View style={s.captureArea}>
+        <Text style={s.debugText}>
+          score: {score.toFixed(2)}  |  frames: {frameCount}/{FRAMES_NEEDED}  |  infer: {inferMs} ms
+        </Text>
+        <Text style={s.debugText}>
+          model: {modelState}  |  side: {eyeSide}
+        </Text>
+
+        <TouchableOpacity
+          style={[
+            s.captureBtn,
+            { backgroundColor: detected ? "#00c853" : "#2a2a2a", borderColor: detected ? "#00ff66" : "#444" },
+            capturing && { opacity: 0.6 },
+          ]}
+          onPress={captureAndNavigate}
+          disabled={capturing}
+          activeOpacity={0.75}
+        >
+          {capturing
+            ? <ActivityIndicator color="#fff" />
+            : <Text style={[s.captureBtnText, { opacity: detected ? 1 : 0.4 }]}>{captureBtnLabel}</Text>
+          }
+        </TouchableOpacity>
       </View>
     </View>
   );
 }
 
-function HudPill({ label, value }: { label: string; value: string }) {
-  return (
-    <View style={s.pill}>
-      <Text style={s.pillLabel}>{label}</Text>
-      <Text style={s.pillValue}>{value}</Text>
-    </View>
-  );
-}
-
+// ─────────────────────────────────────────────────────────────────
+//  STYLES
+// ─────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  root: { flex: 1, backgroundColor: "#000" },
-  center: { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#000" },
-  permText: { fontSize: 17, color: "#5b2d8e", textAlign: "center", padding: 24 },
-  label: { fontSize: 16, color: "#fff" },
+  root:    { flex: 1, backgroundColor: "#000" },
+  center:  { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#000", padding: 24 },
+  permText:{ fontSize: 16, color: "#fff", textAlign: "center" },
+  label:   { fontSize: 16, color: "#fff" },
+
   vig: { position: "absolute", backgroundColor: "rgba(0,0,0,0.58)" },
+
   guide: {
     position: "absolute",
-    left: GUIDE_LEFT,
-    top: GUIDE_TOP,
-    width: GUIDE_SIZE,
-    height: GUIDE_SIZE,
-    borderWidth: 2.5,
-    borderStyle: "dashed",
-    borderColor: "#00e676",
-    borderRadius: 6,
+    left: GUIDE_LEFT, top: GUIDE_TOP,
+    width: GUIDE_SIZE, height: GUIDE_SIZE,
+    borderWidth: 2.5, borderRadius: 6,
+    justifyContent: "center", alignItems: "center",
   },
-  guideDetected: { borderStyle: "solid", borderColor: "#00e676" },
-  guideCapturing: { borderStyle: "solid", borderColor: "#ffeb3b" },
+  corner: { position: "absolute", width: 22, height: 22, borderWidth: 3 },
+  cornerTL: { top: -2, left: -2,   borderBottomWidth: 0, borderRightWidth: 0,  borderTopLeftRadius: 8 },
+  cornerTR: { top: -2, right: -2,  borderBottomWidth: 0, borderLeftWidth: 0,   borderTopRightRadius: 8 },
+  cornerBL: { bottom: -2, left: -2,  borderTopWidth: 0, borderRightWidth: 0,   borderBottomLeftRadius: 8 },
+  cornerBR: { bottom: -2, right: -2, borderTopWidth: 0, borderLeftWidth: 0,    borderBottomRightRadius: 8 },
+  verticalLine:   { position: "absolute", width: 1,  height: "80%", backgroundColor: "rgba(255,255,255,0.2)" },
+  horizontalLine: { position: "absolute", height: 1, width:  "80%", backgroundColor: "rgba(255,255,255,0.2)" },
+  centerDot: { width: 12, height: 12, borderRadius: 6, borderWidth: 2 },
+
   debugEyeBox: { position: "absolute", borderWidth: 2, borderRadius: 4, zIndex: 5 },
-  debugEyeBoxInside: { borderColor: "#00e676" },
+  debugEyeBoxInside:  { borderColor: "#00e676" },
   debugEyeBoxOutside: { borderColor: "#ff5252" },
   debugEyeBoxLabel: {
-    position: "absolute",
-    top: -22,
-    left: -2,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-    color: "#000",
-    fontSize: 10,
-    fontWeight: "900",
-    overflow: "hidden",
+    position: "absolute", top: -22, left: -2,
+    paddingHorizontal: 6, paddingVertical: 2,
+    borderRadius: 4, fontSize: 10, fontWeight: "900", overflow: "hidden",
   },
-  debugEyeBoxLabelInside: { backgroundColor: "#00e676" },
-  debugEyeBoxLabelOutside: { backgroundColor: "#ff5252", color: "#fff" },
-  topLabel: { position: "absolute", top: 56, left: 0, right: 0, alignItems: "center" },
-  eyeTitle: { fontSize: 20, fontWeight: "900", color: "#fff", letterSpacing: 3 },
-  eyeSub: { fontSize: 12, color: "rgba(255,255,255,0.55)", marginTop: 4 },
+  debugLabelInside:  { backgroundColor: "#00e676", color: "#000" },
+  debugLabelOutside: { backgroundColor: "#ff5252", color: "#fff" },
+
   progressTrack: {
     position: "absolute",
     top: GUIDE_TOP + GUIDE_SIZE + 10,
-    left: GUIDE_LEFT,
-    width: GUIDE_SIZE,
-    height: 4,
-    backgroundColor: "rgba(255,255,255,0.18)",
-    borderRadius: 2,
-    overflow: "hidden",
+    left: GUIDE_LEFT, width: GUIDE_SIZE, height: 4,
+    backgroundColor: "rgba(255,255,255,0.18)", borderRadius: 2, overflow: "hidden",
   },
-  progressFill: { height: 4, borderRadius: 2, backgroundColor: "#00e676" },
-  hud: {
-    position: "absolute",
-    bottom: 44,
-    left: 16,
-    right: 16,
-    backgroundColor: "rgba(0,0,0,0.78)",
-    borderRadius: 14,
-    padding: 14,
-    gap: 8,
+  progressFill: { height: 4, borderRadius: 2 },
+
+  topPanel: {
+    position: "absolute", top: 0, left: 0, right: 0,
+    paddingTop: 46, paddingHorizontal: 12, paddingBottom: 8,
+    backgroundColor: "rgba(0,0,0,0.80)", gap: 6, zIndex: 10,
   },
-  row: { flexDirection: "row", alignItems: "center", justifyContent: "space-around" },
-  hudText: { color: "#fff", fontSize: 15, fontWeight: "600" },
-  statusText: { fontSize: 14, fontWeight: "700", textAlign: "center" },
-  statusGreen: { color: "#00e676" },
-  statusGray: { color: "rgba(255,255,255,0.55)" },
-  pill: { alignItems: "center", gap: 2 },
-  pillLabel: { fontSize: 10, color: "rgba(255,255,255,0.45)", textTransform: "uppercase", letterSpacing: 0.5 },
-  pillValue: { fontSize: 13, color: "#fff", fontWeight: "600" },
+  controlRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  backBtn: {
+    paddingVertical: 6, paddingHorizontal: 12, borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)",
+  },
+  backBtnText: { color: "#fff", fontSize: 12, fontWeight: "600" },
+  sideLabel: { backgroundColor: "rgba(91,45,142,0.8)", paddingVertical: 4, paddingHorizontal: 12, borderRadius: 20 },
+  sideLabelText: { color: "#fff", fontWeight: "700", fontSize: 12, letterSpacing: 1 },
+
+  radioGroup: { flexDirection: "row", borderRadius: 10, overflow: "hidden", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
+  radioBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: "rgba(255,255,255,0.07)", borderRightWidth: 1, borderRightColor: "rgba(255,255,255,0.15)" },
+  radioBtnFirst: { borderTopLeftRadius: 10, borderBottomLeftRadius: 10 },
+  radioBtnLast:  { borderTopRightRadius: 10, borderBottomRightRadius: 10, borderRightWidth: 0 },
+  radioBtnActive: { backgroundColor: "rgba(255,215,0,0.18)" },
+  radioLabel: { color: "rgba(255,255,255,0.6)", fontSize: 11, fontWeight: "700" },
+  radioLabelActive: { color: "#FFD700" },
+
+  statusPill: {
+    flexDirection: "row", alignItems: "center", gap: 8,
+    borderWidth: 1, borderRadius: 12,
+    paddingVertical: 8, paddingHorizontal: 12,
+    backgroundColor: "rgba(255,255,255,0.06)",
+  },
+  statusText: { fontSize: 13, fontWeight: "700", flex: 1 },
+
+  instrBox: {
+    borderWidth: 1, borderRadius: 12,
+    paddingVertical: 9, paddingHorizontal: 12,
+    flexDirection: "row", alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.06)",
+  },
+  speakingDot:  { marginRight: 8, justifyContent: "center", alignItems: "center" },
+  speakingPulse:{ width: 9, height: 9, borderRadius: 5, opacity: 0.9 },
+  instrText:    { flex: 1, fontSize: 12.5, fontWeight: "700" },
+  speakBtn:     { paddingLeft: 8 },
+
+  hintBox: { backgroundColor: "rgba(255,255,255,0.06)", borderRadius: 10, paddingVertical: 5, paddingHorizontal: 10 },
+  hintText: { color: "rgba(255,255,255,0.55)", fontSize: 10, textAlign: "center" },
+
+  captureArea: {
+    position: "absolute", left: 0, right: 0, bottom: 0,
+    paddingVertical: 14, paddingHorizontal: 16,
+    alignItems: "center", gap: 6,
+    backgroundColor: "rgba(0,0,0,0.65)",
+  },
+  debugText: { color: "rgba(255,255,255,0.55)", fontSize: 11, fontFamily: "monospace", textAlign: "center" },
+  captureBtn: {
+    marginTop: 4, paddingVertical: 16, paddingHorizontal: 48,
+    borderRadius: 80, borderWidth: 2,
+    alignItems: "center", justifyContent: "center",
+    minWidth: 200, minHeight: 56,
+  },
+  captureBtnText: { color: "#fff", fontSize: 18, fontWeight: "bold" },
 });

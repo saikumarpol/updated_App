@@ -6,6 +6,7 @@ config.resolver.assetExts = [
   ...config.resolver.assetExts,
   "tflite",
   "onnx",
+  "npy",
 ];
 
 module.exports = config;

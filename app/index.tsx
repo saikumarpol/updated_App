@@ -23,9 +23,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 const Icon = MaterialCommunityIcons;
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
 const BASE_URL = "https://pl-api.iiit.ac.in/rcts/anemiav2";
-// const BASE_URL = "http://192.168.1.6:5001";
+// const BASE_URL = "http://192.168.1.4:5001";
+
 const { width: SW } = Dimensions.get("window");
 
 const C = {
@@ -53,62 +53,89 @@ export default function FormScreen() {
     gender?: string;
     eyeSessionId?: string;
     eyeImage?: string;
+    eyeSide?: "left" | "right";
+    leftEyeImage?: string;
+    rightEyeImage?: string;
   }>();
 
-  const [name, setName]               = useState("");
-  const [parentName, setParentName]   = useState("");
+  const [name, setName] = useState("");
+  const [parentName, setParentName] = useState("");
   const [phoneNumber, setPhoneNumber] = useState("");
-  const [age, setAge]                 = useState("");
-  const [gender, setGender]           = useState("");
-  const [eyeImage, setEyeImage]       = useState<string | null>(null);
-  const [eyeSessionId, setEyeSessionId] = useState("");
-  const [loading, setLoading]         = useState(false);
-  const [loadingMsg, setLoadingMsg]   = useState("Processing...");
-  const [previewUri, setPreviewUri]   = useState<string | null>(null);
+  const [age, setAge] = useState("");
+  const [gender, setGender] = useState("");
 
+  const [leftEyeImage, setLeftEyeImage] = useState<string | null>(null);
+  const [rightEyeImage, setRightEyeImage] = useState<string | null>(null);
+  const [eyeSessionId, setEyeSessionId] = useState("");
+
+  const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("Processing...");
+  const [previewUri, setPreviewUri] = useState<string | null>(null);
+
+  // Restore data from navigation params
   useEffect(() => {
-    if (params.name)        setName(params.name);
-    if (params.parentName)  setParentName(params.parentName);
+    if (params.name) setName(params.name);
+    if (params.parentName) setParentName(params.parentName);
     if (params.phoneNumber) setPhoneNumber(params.phoneNumber);
-    if (params.age)         setAge(params.age);
-    if (params.gender)      setGender(params.gender);
+    if (params.age) setAge(params.age);
+    if (params.gender) setGender(params.gender);
     if (params.eyeSessionId) setEyeSessionId(params.eyeSessionId);
-    if (params.eyeImage)    setEyeImage(params.eyeImage);
+
+    if (params.eyeImage && params.eyeSide) {
+      const uri = params.eyeImage as string;
+      if (params.eyeSide === "left") setLeftEyeImage(uri);
+      else if (params.eyeSide === "right") setRightEyeImage(uri);
+    }
+
+    if (params.leftEyeImage) setLeftEyeImage(params.leftEyeImage);
+    if (params.rightEyeImage) setRightEyeImage(params.rightEyeImage);
   }, [params]);
 
   const isMinor = age ? parseInt(age) < 18 : false;
+  const hasAnyEyeImage = !!(leftEyeImage || rightEyeImage);
 
   const progress = Math.min(
     100,
-    (eyeImage ? 50 : 0) + (name || age || gender ? 50 : 0)
+    (hasAnyEyeImage ? 50 : 0) + (name || age || gender ? 50 : 0)
   );
 
   const resetForm = () => {
-    setName(""); setParentName(""); setPhoneNumber("");
-    setAge(""); setGender("");
-    setEyeImage(null); setEyeSessionId("");
+    setName("");
+    setParentName("");
+    setPhoneNumber("");
+    setAge("");
+    setGender("");
+    setLeftEyeImage(null);
+    setRightEyeImage(null);
+    setEyeSessionId("");
   };
 
-  const goToCapture = () => {
+  const goToCapture = (side: "left" | "right") => {
     router.push({
       pathname: "/eye-capture",
-      params: { name, parentName, phoneNumber, age, gender, eyeSessionId, eyeImage: eyeImage ?? "" },
+      params: {
+        name,
+        parentName,
+        phoneNumber,
+        age,
+        gender,
+        eyeSessionId,
+        leftEyeImage: leftEyeImage ?? "",
+        rightEyeImage: rightEyeImage ?? "",
+        eyeSide: side,
+      },
     });
   };
 
-  // ── Submit ─────────────────────────────────────────────────────
+  // ── Submit to Real Anemia API ───────────────────────
   const submitData = async () => {
-    if (!eyeImage) {
-      Alert.alert("Missing Image", "Please capture an eye image.");
+    if (!leftEyeImage && !rightEyeImage) {
+      Alert.alert("Missing Image", "Please capture at least one eye image.");
       return;
     }
 
     setLoading(true);
-    setLoadingMsg("Uploading image…");
-
-    // TODO: API Hb values are unreliable — generate random Hb for demo
-    // Swap back to API value (leftHb / rightHb) when model is fixed
-    const demoHb = parseFloat((Math.random() * (12.9 - 11.9) + 11.9).toFixed(1));
+    setLoadingMsg("Uploading images...");
 
     const formData = new FormData();
     formData.append("name", name || "");
@@ -118,47 +145,87 @@ export default function FormScreen() {
     formData.append("gender", gender || "");
     if (eyeSessionId) formData.append("eyeSessionId", eyeSessionId);
 
-    // Send demo Hb so it gets saved in MongoDB and shows correctly on
-    // view/dashboard without any backend changes
-    formData.append("demoHb", String(demoHb));
+    if (leftEyeImage) {
+      formData.append("leftEyeImage", {
+        uri: leftEyeImage,
+        type: "image/jpeg",
+        name: `left_${Date.now()}.jpg`,
+      } as any);
+    }
+    if (rightEyeImage) {
+      formData.append("rightEyeImage", {
+        uri: rightEyeImage,
+        type: "image/jpeg",
+        name: `right_${Date.now()}.jpg`,
+      } as any);
+    }
 
-    // ✅ field name matches server's multer config
-    formData.append("leftEyeImage", {
-      uri: eyeImage,
-      type: "image/jpeg",
-      name: `eye_${Date.now()}.jpg`,
-    } as any);
-
-    const MESSAGES = ["Uploading image…", "Analysing eye…", "Finalizing…"];
+    const MESSAGES = ["Uploading images…", "Analysing eye…", "Finalizing…"];
     let msgIdx = 0;
     const msgTimer = setInterval(() => {
       msgIdx = Math.min(msgIdx + 1, MESSAGES.length - 1);
       setLoadingMsg(MESSAGES[msgIdx]);
-    }, 6000);
+    }, 4500);
 
     try {
-      await axios.post(`${BASE_URL}/api/children`, formData, {
+      const response = await axios.post(`${BASE_URL}/api/children`, formData, {
         headers: { "Content-Type": "multipart/form-data" },
-        timeout: 360000,
+        timeout: 60000,
       });
+
       clearInterval(msgTimer);
+      setLoading(false);
+
+      const data = response.data;
+
+      // Extract Hb values from API response (adjust keys if your API uses different structure)
+      let leftHb: number | null = null;
+      let rightHb: number | null = null;
+
+      if (data.leftEye?.hb !== undefined) leftHb = parseFloat(data.leftEye.hb);
+      else if (data.leftHb !== undefined) leftHb = parseFloat(data.leftHb);
+
+      if (data.rightEye?.hb !== undefined) rightHb = parseFloat(data.rightEye.hb);
+      else if (data.rightHb !== undefined) rightHb = parseFloat(data.rightHb);
+
+      // Fallback
+      if (!leftHb && !rightHb && data.hb) {
+        leftHb = rightHb = parseFloat(data.hb);
+      }
+
+      const leftText = leftHb
+        ? `Left Eye  → Hb: ${leftHb.toFixed(1)} g/dL`
+        : "";
+      const rightText = rightHb
+        ? `Right Eye → Hb: ${rightHb.toFixed(1)} g/dL`
+        : "";
 
       Alert.alert(
         "✅ Analysis Complete",
-        `Hb: ${demoHb} g/dL`,
-        [{
-          text: "View Dashboard",
-          onPress: () => { resetForm(); router.replace("/(tabs)/dashboard"); },
-        }]
+        [leftText, rightText].filter(Boolean).join("\n\n") || "Analysis completed successfully.",
+        [
+          {
+            text: "View Dashboard",
+            onPress: () => {
+              resetForm();
+              router.replace("/(tabs)/dashboard");
+            },
+          },
+        ]
       );
     } catch (error: any) {
       clearInterval(msgTimer);
-      const detail = error.response?.data
-        ? JSON.stringify(error.response.data)
-        : error.message;
-      Alert.alert("Upload Failed", `${error.response?.status ?? ""} ${detail}`);
-    } finally {
       setLoading(false);
+
+      console.error("Submit error:", error.response?.data || error);
+
+      const errorMsg =
+        error.response?.data?.message ||
+        error.response?.data?.error ||
+        error.message ||
+        "Failed to connect to server. Please try again.";
+
+      Alert.alert("Upload Failed", errorMsg);
     }
   };
 
@@ -185,19 +252,22 @@ export default function FormScreen() {
 
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
         <ScrollView style={{ backgroundColor: C.page }} contentContainerStyle={s.scroll} keyboardShouldPersistTaps="always">
-
+          {/* Personal Info */}
           <View style={s.card}>
             <Text style={s.sect}>Personal Info</Text>
             <Field label="Name" value={name} onChange={setName} placeholder="Enter full name" />
             <Field label="Age (years)" value={age} onChange={setAge} placeholder="Age" keyboard="numeric" />
             <Field label="Phone Number" value={phoneNumber} onChange={setPhoneNumber} placeholder="10-digit mobile number" keyboard="phone-pad" />
-            {isMinor && (
-              <Field label="Parent/Guardian Name" value={parentName} onChange={setParentName} placeholder="Enter parent name" />
-            )}
+            {isMinor && <Field label="Parent/Guardian Name" value={parentName} onChange={setParentName} placeholder="Enter parent name" />}
+            
             <Text style={s.fieldLabel}>Gender</Text>
             <View style={s.genderRow}>
               {(["Male", "Female"] as const).map((g) => (
-                <TouchableOpacity key={g} style={[s.genderBtn, gender === g && s.genderBtnActive]} onPress={() => setGender(g)}>
+                <TouchableOpacity
+                  key={g}
+                  style={[s.genderBtn, gender === g && s.genderBtnActive]}
+                  onPress={() => setGender(g)}
+                >
                   <Text style={[s.genderText, gender === g && s.genderTextActive]}>
                     {g === "Male" ? "♂ " : "♀ "}{g}
                   </Text>
@@ -206,24 +276,58 @@ export default function FormScreen() {
             </View>
           </View>
 
+          {/* Eye Capture */}
           <View style={s.card}>
-            <Text style={s.sect}>Capture Eye Image</Text>
-            <Text style={s.eyeHint}>An eye image is required for analysis</Text>
-            <TouchableOpacity style={[s.imgBtn, eyeImage ? s.imgBtnDone : s.imgBtnReady]} onPress={goToCapture}>
-              <Icon name={eyeImage ? "camera-retake-outline" : "camera-plus-outline"} size={20} color="#fff" />
-              <View>
-                <Text style={s.imgBtnText}>{eyeImage ? "Re-capture Eye" : "Capture Eye"}</Text>
-                <Text style={s.imgBtnSub}>Tap to open camera</Text>
+            <Text style={s.sect}>Capture Eye Images</Text>
+            <Text style={s.eyeHint}>At least one eye image is required</Text>
+
+            <View style={s.eyeRow}>
+              <View style={s.eyeCol}>
+                <TouchableOpacity
+                  style={[s.imgBtn, leftEyeImage ? s.imgBtnDone : s.imgBtnReady]}
+                  onPress={() => goToCapture("left")}
+                >
+                  <Icon name={leftEyeImage ? "camera-retake-outline" : "camera-plus-outline"} size={20} color="#fff" />
+                  <View>
+                    <Text style={s.imgBtnText}>{leftEyeImage ? "Re-capture" : "Capture"}</Text>
+                    <Text style={s.imgBtnSub}>LEFT Eye</Text>
+                  </View>
+                </TouchableOpacity>
+                {leftEyeImage && (
+                  <TouchableOpacity onPress={() => setPreviewUri(leftEyeImage)} style={s.thumb}>
+                    <Image source={{ uri: leftEyeImage }} style={s.thumbImg} resizeMode="cover" />
+                    <View style={[s.thumbBadge, { backgroundColor: C.purple }]}>
+                      <Text style={s.thumbBadgeText}>L</Text>
+                    </View>
+                  </TouchableOpacity>
+                )}
               </View>
-            </TouchableOpacity>
-            {eyeImage && (
-              <TouchableOpacity onPress={() => setPreviewUri(eyeImage)} style={s.thumb}>
-                <Image source={{ uri: eyeImage }} style={s.thumbImg} resizeMode="cover" />
-                <View style={s.thumbBadge}><Text style={s.thumbBadgeText}>Eye</Text></View>
-              </TouchableOpacity>
-            )}
+
+              <View style={s.eyeCol}>
+                <TouchableOpacity
+                  style={[s.imgBtn, rightEyeImage ? s.imgBtnDone : s.imgBtnReady]}
+                  onPress={() => goToCapture("right")}
+                >
+                  <Icon name={rightEyeImage ? "camera-retake-outline" : "camera-plus-outline"} size={20} color="#fff" />
+                  <View>
+                    <Text style={s.imgBtnText}>{rightEyeImage ? "Re-capture" : "Capture"}</Text>
+                    <Text style={s.imgBtnSub}>RIGHT Eye</Text>
+                  </View>
+                </TouchableOpacity>
+                {rightEyeImage && (
+                  <TouchableOpacity onPress={() => setPreviewUri(rightEyeImage)} style={s.thumb}>
+                    <Image source={{ uri: rightEyeImage }} style={s.thumbImg} resizeMode="cover" />
+                    <View style={[s.thumbBadge, { backgroundColor: "#c2185b" }]}>
+                      <Text style={s.thumbBadgeText}>R</Text>
+                    </View>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+
             <View style={s.statusRow}>
-              <StatusPill ok={!!eyeImage} label="Eye image" />
+              <StatusPill ok={!!leftEyeImage} label="Left eye" />
+              <StatusPill ok={!!rightEyeImage} label="Right eye" />
             </View>
           </View>
 
@@ -245,11 +349,16 @@ export default function FormScreen() {
         </ScrollView>
       </KeyboardAvoidingView>
 
+      {/* Image Preview Modal */}
       <Modal visible={!!previewUri} transparent animationType="fade" onRequestClose={() => setPreviewUri(null)}>
         <TouchableOpacity style={s.modalOverlay} activeOpacity={1} onPress={() => setPreviewUri(null)}>
           {previewUri && (
             <View style={s.modalCard}>
-              <Image source={{ uri: previewUri }} style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE, borderRadius: 16 }} resizeMode="contain" />
+              <Image
+                source={{ uri: previewUri }}
+                style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE, borderRadius: 16 }}
+                resizeMode="contain"
+              />
               <Text style={s.modalHint}>Tap anywhere to close</Text>
             </View>
           )}
@@ -259,13 +368,19 @@ export default function FormScreen() {
   );
 }
 
-function Field({ label, value, onChange, placeholder, keyboard = "default" }: {
-  label: string; value: string; onChange: (v: string) => void; placeholder: string; keyboard?: any;
-}) {
+// ── Sub Components ─────────────────────────────────────
+function Field({ label, value, onChange, placeholder, keyboard = "default" }: any) {
   return (
     <>
       <Text style={s.fieldLabel}>{label}</Text>
-      <TextInput style={s.input} value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor="#bbb" keyboardType={keyboard} />
+      <TextInput
+        style={s.input}
+        value={value}
+        onChangeText={onChange}
+        placeholder={placeholder}
+        placeholderTextColor="#bbb"
+        keyboardType={keyboard}
+      />
     </>
   );
 }
@@ -273,7 +388,9 @@ function Field({ label, value, onChange, placeholder, keyboard = "default" }: {
 function StatusPill({ ok, label }: { ok: boolean; label: string }) {
   return (
     <View style={[s.pill, { backgroundColor: ok ? "#e8f5e9" : "#f1f3f5" }]}>
-      <Text style={[s.pillText, { color: ok ? "#2f9e44" : "#868e96" }]}>{ok ? "✓" : "○"} {label}</Text>
+      <Text style={[s.pillText, { color: ok ? "#2f9e44" : "#868e96" }]}>
+        {ok ? "✓" : "○"} {label}
+      </Text>
     </View>
   );
 }
@@ -305,7 +422,7 @@ const s = StyleSheet.create({
   imgBtnSub: { color: "rgba(255,255,255,0.7)", fontSize: 11 },
   thumb: { marginBottom: 8, borderRadius: 10, overflow: "hidden", position: "relative", aspectRatio: 1, width: "100%" },
   thumbImg: { width: "100%", height: "100%" },
-  thumbBadge: { position: "absolute", top: 6, left: 6, paddingVertical: 2, paddingHorizontal: 8, borderRadius: 6, backgroundColor: "#5b2d8e" },
+  thumbBadge: { position: "absolute", top: 6, left: 6, paddingVertical: 2, paddingHorizontal: 8, borderRadius: 6 },
   thumbBadgeText: { color: "#fff", fontWeight: "700", fontSize: 10 },
   statusRow: { flexDirection: "row", gap: 8, flexWrap: "wrap", marginTop: 10 },
   pill: { paddingVertical: 5, paddingHorizontal: 12, borderRadius: 20 },
@@ -318,4 +435,6 @@ const s = StyleSheet.create({
   modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.92)", justifyContent: "center", alignItems: "center" },
   modalCard: { alignItems: "center" },
   modalHint: { color: "rgba(255,255,255,0.4)", marginTop: 14, fontSize: 13 },
+  eyeRow: { flexDirection: "row", gap: 12, marginBottom: 12 },
+  eyeCol: { flex: 1 },
 });
