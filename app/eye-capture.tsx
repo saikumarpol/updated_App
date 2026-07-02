@@ -16,18 +16,19 @@ import {
   useCameraPermission,
   useFrameProcessor,
 } from "react-native-vision-camera";
-import { InferenceSession, Tensor } from "onnxruntime-react-native";
+import { useTensorflowModel } from "react-native-fast-tflite";
 import { useResizePlugin } from "vision-camera-resize-plugin";
 import { Worklets } from "react-native-worklets-core";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as Speech from "expo-speech";
-import Svg, { Path, Circle } from "react-native-svg";
-import { Asset } from "expo-asset";
+import Svg, { Path, Circle, Line } from "react-native-svg";
 
 const TAG = `[EYE:${Platform.OS}]`;
 const LOG_EVERY_N_FRAMES = 15;
 
 const MODEL_SIZE = 320;
+const NUM_DETECTIONS = 300;
+const VALS_PER_BOX = 6;
 const CONF_THRESHOLD = 0.25;
 const FRAMES_NEEDED = 4;
 const OUTPUT_SIZE = 512;
@@ -40,7 +41,12 @@ const GUIDE_RIGHT = GUIDE_LEFT + GUIDE_SIZE;
 const GUIDE_BOTTOM = GUIDE_TOP + GUIDE_SIZE;
 const GUIDE_INNER_MARGIN = GUIDE_SIZE * 0.1;
 
-type Lang = "en" | "hi" | "te";
+const BLUR_THRESHOLD = 30;
+const BRIGHTNESS_LOW = 65;
+const BRIGHTNESS_HIGH = 205;
+const CCT_WARM_THRESHOLD = 3900;
+const CCT_WARM_BIAS = 1.0;
+const Q_STEP = 4;
 
 type DebugEyeBox = {
   left: number;
@@ -51,34 +57,60 @@ type DebugEyeBox = {
   insideGuide: boolean;
 };
 
-// ── Coordinate helpers ────────────────────────────────────────────
+type Lang = "en" | "hi" | "te";
+type LightStatus = "good" | "low" | "high";
+type BlurStatus = "good" | "blurry";
+type TempStatus = "good" | "warm";
+
+interface QualityState {
+  blurScore: number;
+  blurStatus: BlurStatus;
+  brightness: number;
+  lightStatus: LightStatus;
+  cct: number;
+  tempStatus: TempStatus;
+}
+
+function normalizeModelCoordinate(value: number) {
+  "worklet";
+  return value > 1 ? value / MODEL_SIZE : value;
+}
 
 function getEyeBoxOnScreen(x1: number, y1: number, x2: number, y2: number) {
   "worklet";
-  const left   = (Math.min(x1, x2) / MODEL_SIZE) * SW;
-  const top    = (Math.min(y1, y2) / MODEL_SIZE) * SH;
-  const right  = (Math.max(x1, x2) / MODEL_SIZE) * SW;
-  const bottom = (Math.max(y1, y2) / MODEL_SIZE) * SH;
-  return { left, top, right, bottom, width: right - left, height: bottom - top };
+  const left = normalizeModelCoordinate(Math.min(x1, x2)) * SW;
+  const top = normalizeModelCoordinate(Math.min(y1, y2)) * SH;
+  const right = normalizeModelCoordinate(Math.max(x1, x2)) * SW;
+  const bottom = normalizeModelCoordinate(Math.max(y1, y2)) * SH;
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+  };
 }
 
-function checkEyeWithinGuideBox(x1: number, y1: number, x2: number, y2: number) {
+function checkEyeWithinGuideBox(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+) {
   "worklet";
-  // Model outputs a large near-full-frame box; requiring the whole box
-  // to fit inside the guide will always fail. Check center point instead.
-  const cx = ((x1 + x2) / 2 / MODEL_SIZE) * SW;
-  const cy = ((y1 + y2) / 2 / MODEL_SIZE) * SH;
-
-  const innerLeft   = GUIDE_LEFT   + GUIDE_INNER_MARGIN;
-  const innerTop    = GUIDE_TOP    + GUIDE_INNER_MARGIN;
-  const innerRight  = GUIDE_RIGHT  - GUIDE_INNER_MARGIN;
+  const box = getEyeBoxOnScreen(x1, y1, x2, y2);
+  const innerLeft = GUIDE_LEFT + GUIDE_INNER_MARGIN;
+  const innerTop = GUIDE_TOP + GUIDE_INNER_MARGIN;
+  const innerRight = GUIDE_RIGHT - GUIDE_INNER_MARGIN;
   const innerBottom = GUIDE_BOTTOM - GUIDE_INNER_MARGIN;
-
   return (
-    cx >= innerLeft  &&
-    cx <= innerRight &&
-    cy >= innerTop   &&
-    cy <= innerBottom
+    box.width > 0 &&
+    box.height > 0 &&
+    box.left >= innerLeft &&
+    box.top >= innerTop &&
+    box.right <= innerRight &&
+    box.bottom <= innerBottom
   );
 }
 
@@ -86,23 +118,178 @@ function getResizeRotation(
   orientation: string,
 ): "0deg" | "90deg" | "180deg" | "270deg" {
   "worklet";
-  if (Platform.OS === "android") return "270deg";
+  if (Platform.OS === "android") {
+    return "270deg";
+  }
   switch (orientation) {
-    case "landscape-right":       return "90deg";
-    case "landscape-left":        return "270deg";
-    case "portrait-upside-down":  return "180deg";
+    case "landscape-right":
+      return "90deg";
+    case "landscape-left":
+      return "270deg";
+    case "portrait-upside-down":
+      return "180deg";
     case "portrait":
-    default:                      return "90deg";
+    default:
+      return "0deg";
   }
 }
 
-// ── Voice ─────────────────────────────────────────────────────────
+function computeFrameQuality(
+  qd: Float32Array,
+  qW: number,
+  qH: number,
+): QualityState {
+  "worklet";
+
+  let lumaSum = 0,
+    lumaCount = 0;
+  for (let qy = 0; qy < qH; qy += Q_STEP) {
+    for (let qx = 0; qx < qW; qx += Q_STEP) {
+      const b = (qy * qW + qx) * 3;
+      const r = qd[b] * 255,
+        g = qd[b + 1] * 255,
+        bv = qd[b + 2] * 255;
+      lumaSum += 0.299 * r + 0.587 * g + 0.114 * bv;
+      lumaCount++;
+    }
+  }
+  const brightness = lumaCount > 0 ? lumaSum / lumaCount : 0;
+  const lightStatus: LightStatus =
+    brightness < BRIGHTNESS_LOW
+      ? "low"
+      : brightness > BRIGHTNESS_HIGH
+        ? "high"
+        : "good";
+
+  const gsW = Math.floor(qW / Q_STEP);
+  const gsH = Math.floor(qH / Q_STEP);
+  const gray = new Float32Array(gsW * gsH);
+  for (let sy = 0; sy < gsH; sy++) {
+    for (let sx = 0; sx < gsW; sx++) {
+      const b = (sy * Q_STEP * qW + sx * Q_STEP) * 3;
+      gray[sy * gsW + sx] =
+        0.299 * qd[b] * 255 + 0.587 * qd[b + 1] * 255 + 0.114 * qd[b + 2] * 255;
+    }
+  }
+  let lapSum = 0,
+    lapSumSq = 0,
+    lapCount = 0;
+  for (let ly = 1; ly < gsH - 1; ly++) {
+    for (let lx = 1; lx < gsW - 1; lx += 2) {
+      const idx = ly * gsW + lx;
+      const lap =
+        gray[(ly - 1) * gsW + lx] +
+        gray[(ly + 1) * gsW + lx] +
+        gray[ly * gsW + (lx - 1)] +
+        gray[ly * gsW + (lx + 1)] -
+        4 * gray[idx];
+      lapSum += lap;
+      lapSumSq += lap * lap;
+      lapCount++;
+    }
+  }
+  const blurMean = lapCount > 0 ? lapSum / lapCount : 0;
+  const blurScore =
+    lapCount > 0 ? lapSumSq / lapCount - blurMean * blurMean : 0;
+  const blurStatus: BlurStatus =
+    blurScore >= BLUR_THRESHOLD ? "good" : "blurry";
+
+  let cctSumX = 0,
+    cctSumY = 0,
+    cctSumZ = 0,
+    cctValid = 0;
+  for (let cy = 0; cy < qH; cy += Q_STEP) {
+    for (let cx = 0; cx < qW; cx += Q_STEP) {
+      const b = (cy * qW + cx) * 3;
+      const rv = qd[b],
+        gv = qd[b + 1],
+        bv2 = qd[b + 2];
+      const r8 = rv * 255,
+        g8 = gv * 255,
+        b8 = bv2 * 255;
+      const maxV = r8 > g8 ? (r8 > b8 ? r8 : b8) : g8 > b8 ? g8 : b8;
+      const minV = r8 < g8 ? (r8 < b8 ? r8 : b8) : g8 < b8 ? g8 : b8;
+      const sat = maxV === 0 ? 0 : (maxV - minV) / maxV;
+      if (maxV < 35 || sat > 0.82 || (r8 > 210 && g8 < 100 && b8 < 100))
+        continue;
+      const rl =
+        rv <= 0.04045 ? rv / 12.92 : Math.pow((rv + 0.055) / 1.055, 2.4);
+      const gl2 =
+        gv <= 0.04045 ? gv / 12.92 : Math.pow((gv + 0.055) / 1.055, 2.4);
+      const bl2 =
+        bv2 <= 0.04045 ? bv2 / 12.92 : Math.pow((bv2 + 0.055) / 1.055, 2.4);
+      cctSumX += 0.4124564 * rl + 0.3575761 * gl2 + 0.1804375 * bl2;
+      cctSumY += 0.2126729 * rl + 0.7151522 * gl2 + 0.072175 * bl2;
+      cctSumZ += 0.0193339 * rl + 0.119192 * gl2 + 0.9503041 * bl2;
+      cctValid++;
+    }
+  }
+  let cct = 5500;
+  if (cctValid >= 20) {
+    const Xv = cctSumX / cctValid,
+      Yv = cctSumY / cctValid,
+      Zv = cctSumZ / cctValid;
+    const tot = Xv + Yv + Zv;
+    if (tot > 0) {
+      const xc = Xv / tot,
+        yc = Yv / tot;
+      const nc = (xc - 0.332) / (yc - 0.1858);
+      const raw =
+        -449 * nc * nc * nc + 3525 * nc * nc - 6823.3 * nc + 5520.33;
+      cct = (raw < 2000 ? 2000 : raw > 10000 ? 10000 : raw) * CCT_WARM_BIAS;
+    }
+  }
+  const tempStatus: TempStatus = cct < CCT_WARM_THRESHOLD ? "warm" : "good";
+
+  return { blurScore, blurStatus, brightness, lightStatus, cct, tempStatus };
+}
 
 const VOICE: Record<string, Record<Lang, { text: string; bcp47: string }>> = {
   alignFace: {
-    en: { text: "Pull down your lower eyelid and fill the box with the pink area.", bcp47: "en-IN" },
-    hi: { text: "निचली पलक को नीचे खींचें और गुलाबी हिस्से से बॉक्स भरें।", bcp47: "hi-IN" },
-    te: { text: "కింది రెప్పను కిందకు లాగి, గులాబీ భాగంతో బాక్స్ నింపండి.", bcp47: "te-IN" },
+    en: {
+      text: "Pull down your lower eyelid and fill the box with the pink area.",
+      bcp47: "en-IN",
+    },
+    hi: {
+      text: "निचली पलक को नीचे खींचें और गुलाबी हिस्से से बॉक्स भरें।",
+      bcp47: "hi-IN",
+    },
+    te: {
+      text: "కింది రెప్పను కిందకు లాగి, గులాబీ భాగంతో బాక్స్ నింపండి.",
+      bcp47: "te-IN",
+    },
+  },
+  lowLight: {
+    en: { text: "Move to a brighter place.", bcp47: "en-IN" },
+    hi: { text: "रोशनी वाली जगह पर जाएं।", bcp47: "hi-IN" },
+    te: { text: "వెలుతురు ఉన్న చోటికి వెళ్ళండి.", bcp47: "te-IN" },
+  },
+  highLight: {
+    en: { text: "Too much light. Move away from window.", bcp47: "en-IN" },
+    hi: { text: "बहुत रोशनी है। खिड़की से दूर जाएं।", bcp47: "hi-IN" },
+    te: {
+      text: "చాలా వెలుతురు. కిటికీ నుండి దూరంగా వెళ్ళండి.",
+      bcp47: "te-IN",
+    },
+  },
+  holdStill: {
+    en: { text: "Hold your phone steady.", bcp47: "en-IN" },
+    hi: { text: "फोन को स्थिर रखें।", bcp47: "hi-IN" },
+    te: { text: "ఫోన్‌ను స్థిరంగా పట్టుకోండి.", bcp47: "te-IN" },
+  },
+  warmLight: {
+    en: {
+      text: "Avoid yellow light. Use neutral white light for better result.",
+      bcp47: "en-IN",
+    },
+    hi: {
+      text: "पीली रोशनी से बचें। बेहतर परिणाम के लिए सफेद रोशनी का उपयोग करें।",
+      bcp47: "hi-IN",
+    },
+    te: {
+      text: "పసుపు వెలుతురు నుండి దూరంగా ఉండండి. మంచి ఫలితం కోసం తెల్లటి వెలుతురు ఉపయోగించండి.",
+      bcp47: "te-IN",
+    },
   },
   allGood: {
     en: { text: "Good! Capturing now.", bcp47: "en-IN" },
@@ -111,15 +298,51 @@ const VOICE: Record<string, Record<Lang, { text: string; bcp47: string }>> = {
   },
 };
 
-// ── Icons ─────────────────────────────────────────────────────────
+function getProblemKey(
+  eyeConfirmed: boolean,
+  lightStatus: string,
+  blurStatus: string,
+  tempStatus: string,
+): string {
+  if (!eyeConfirmed) return "alignFace";
+  if (lightStatus === "low") return "lowLight";
+  if (lightStatus === "high") return "highLight";
+  if (tempStatus === "warm") return "warmLight";
+  if (blurStatus === "blurry") return "holdStill";
+  return "allGood";
+}
 
 const IconEye = ({ size = 24, color = "#fff" }) => (
   <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
     <Path
       d="M1 12C1 12 5 5 12 5C19 5 23 12 23 12C23 12 19 19 12 19C5 19 1 12 1 12Z"
-      stroke={color} strokeWidth="2" strokeLinejoin="round"
+      stroke={color}
+      strokeWidth="2"
+      strokeLinejoin="round"
     />
     <Circle cx="12" cy="12" r="3.5" stroke={color} strokeWidth="2" />
+  </Svg>
+);
+
+const IconLight = ({ size = 24, color = "#fff" }) => (
+  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <Circle cx="12" cy="12" r="4" stroke={color} strokeWidth="2" />
+    <Line x1="12" y1="2" x2="12" y2="5" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="12" y1="19" x2="12" y2="22" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="2" y1="12" x2="5" y2="12" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="19" y1="12" x2="22" y2="12" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="4.93" y1="4.93" x2="7.05" y2="7.05" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="16.95" y1="16.95" x2="19.07" y2="19.07" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="19.07" y1="4.93" x2="16.95" y2="7.05" stroke={color} strokeWidth="2" strokeLinecap="round" />
+    <Line x1="7.05" y1="16.95" x2="4.93" y2="19.07" stroke={color} strokeWidth="2" strokeLinecap="round" />
+  </Svg>
+);
+
+const IconBlur = ({ size = 24, color = "#fff" }) => (
+  <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <Circle cx="12" cy="12" r="10" stroke={color} strokeWidth="2" />
+    <Path d="M12 2C12 2 15 7 14 12C13 17 12 22 12 22" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
+    <Path d="M2 12C2 12 7 9 12 10C17 11 22 12 22 12" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
   </Svg>
 );
 
@@ -127,15 +350,21 @@ const IconSpeaker = ({ size = 22, color = "#fff" }) => (
   <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
     <Path
       d="M11 5L6 9H3C2.45 9 2 9.45 2 10V14C2 14.55 2.45 15 3 15H6L11 19V5Z"
-      stroke={color} strokeWidth="2" strokeLinejoin="round"
+      stroke={color}
+      strokeWidth="2"
+      strokeLinejoin="round"
     />
     <Path
       d="M15.54 8.46C16.48 9.4 17 10.67 17 12C17 13.33 16.48 14.6 15.54 15.54"
-      stroke={color} strokeWidth="2" strokeLinecap="round"
+      stroke={color}
+      strokeWidth="2"
+      strokeLinecap="round"
     />
     <Path
       d="M19.07 4.93C20.96 6.82 22 9.35 22 12C22 14.65 20.96 17.18 19.07 19.07"
-      stroke={color} strokeWidth="2" strokeLinecap="round"
+      stroke={color}
+      strokeWidth="2"
+      strokeLinecap="round"
     />
   </Svg>
 );
@@ -160,233 +389,154 @@ export default function EyeCaptureScreen() {
   const { eyeSide = "right" } = params;
 
   const cameraRef = useRef<Camera>(null);
+
   const { hasPermission, requestPermission } = useCameraPermission();
   const device = useCameraDevice("front");
 
-  const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
-  const sessionRef = useRef<InferenceSession | null>(null);
-
-  // ── Load ONNX model ───────────────────────────────────────────
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [asset] = await Asset.loadAsync(
-          require("../assets/model/2026-06-24__mnv3ssd-320-best-model-with-postprocess.onnx"),
-        );
-        if (!asset.localUri) throw new Error("Asset failed to resolve to a local URI");
-        const modelPath = asset.localUri.replace("file://", "");
-        console.log(`${TAG} 📦 model path: ${modelPath}`);
-        const s = await InferenceSession.create(modelPath);
-        if (!cancelled) {
-          sessionRef.current = s;
-          setModelState("ready");
-          console.log(`${TAG} ✅ ONNX loaded. inputs=${s.inputNames} outputs=${s.outputNames}`);
-        }
-      } catch (err: any) {
-        if (!cancelled) {
-          console.error(`${TAG} ❌ ONNX load failed:`, err?.message ?? String(err));
-          setModelState("error");
-        }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
+  const { model, state: modelState } = useTensorflowModel(
+    require("../assets/model/11-06-2026-yolo-26-n-best_float32.tflite"),
+  );
   const { resize } = useResizePlugin();
 
-  // ── UI state ──────────────────────────────────────────────────
-  const [detected,    setDetected]    = useState(false);
-  const [score,       setScore]       = useState(0);
-  const [frameCount,  setFrameCount]  = useState(0);
-  const [statusMsg,   setStatusMsg]   = useState("Position eye in the box");
-  const [capturing,   setCapturing]   = useState(false);
+  const [detected, setDetected] = useState(false);
+  const [score, setScore] = useState(0);
+  const [frameCount, setFrameCount] = useState(0);
+  const [statusMsg, setStatusMsg] = useState("Position eye in the box");
+  const [capturing, setCapturing] = useState(false);
+  const [debugging, setDebugging] = useState(false);
   const [debugEyeBox, setDebugEyeBox] = useState<DebugEyeBox | null>(null);
-  const [inferMs,     setInferMs]     = useState(0);   // ← inference timing
 
-  const [lang,        setLang]        = useState<Lang>("en");
-  const [isSpeaking,  setIsSpeaking]  = useState(false);
 
-  const cameraReadyRef    = useRef(false);
-  const capturingRef      = useRef(false);
-  const consecutiveRef    = useRef(0);
+  const [quality, setQuality] = useState<QualityState>({
+    blurScore: 0,
+    blurStatus: "blurry",
+    brightness: 0,
+    lightStatus: "low",
+    cct: 5500,
+    tempStatus: "good",
+  });
+
+  const [lang, setLang] = useState<Lang>("en");
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
+  const cameraReadyRef = useRef(false);
+  const capturingRef = useRef(false);
+  const consecutiveRef = useRef(0);
   const frameLogCounterRef = useRef(0);
-  const lastSpokenKey     = useRef<string | null>(null);
-  const lastSpokenTime    = useRef<number>(0);
 
-  // Worklet → JS bridges
-  const setDetectedJS   = Worklets.createRunOnJS(setDetected);
-  const setScoreJS      = Worklets.createRunOnJS(setScore);
+  const lastSpokenKey = useRef<string | null>(null);
+  const lastSpokenTime = useRef<number>(0);
+
+  const setDetectedJS = Worklets.createRunOnJS(setDetected);
+  const setScoreJS = Worklets.createRunOnJS(setScore);
   const setFrameCountJS = Worklets.createRunOnJS(setFrameCount);
-  const setStatusMsgJS  = Worklets.createRunOnJS(setStatusMsg);
+  const setStatusMsgJS = Worklets.createRunOnJS(setStatusMsg);
   const setDebugEyeBoxJS = Worklets.createRunOnJS(setDebugEyeBox);
-  const setInferMsJS    = Worklets.createRunOnJS(setInferMs);
+  const setQualityJS = Worklets.createRunOnJS(setQuality);
 
   useEffect(() => () => Speech.stop(), []);
 
-  // ── Capture & navigate ────────────────────────────────────────
-  const captureAndNavigate = useCallback(async () => {
-    if (capturingRef.current) return;
-    const camera = cameraRef.current;
-    if (!cameraReadyRef.current || !camera) {
-      console.warn(`${TAG} ⚠️ capture blocked — camera not ready`);
-      return;
+  useEffect(() => {
+    console.log(
+      `${TAG} mounted. Platform.Version=${Platform.Version} hasPermission=${hasPermission}`,
+    );
+  }, []);
+
+  useEffect(() => {
+    console.log(`${TAG} hasPermission -> ${hasPermission}`);
+  }, [hasPermission]);
+
+  useEffect(() => {
+    console.log(
+      `${TAG} device -> ${
+        device
+          ? `id=${device.id} position=${device.position} formats=${device.formats?.length ?? 0}`
+          : "null"
+      }`,
+    );
+  }, [device]);
+
+  useEffect(() => {
+    console.log(`${TAG} modelState -> ${modelState}`);
+    if (modelState === "error") {
+      console.error(`${TAG} ❌ MODEL FAILED TO LOAD on this platform`);
     }
+  }, [modelState]);
 
-    capturingRef.current = true;
-    setCapturing(true);
-    setStatusMsg("Capturing…");
+  // ── ONLY CHANGE: router.replace now sends eyeImage instead of left/rightEyeImage ──
+// ── Updated captureAndNavigate ─────────────────────────────────────
+const captureAndNavigate = useCallback(async () => {
+  if (capturingRef.current) return;
 
-    try {
-      const photo = await camera.takeSnapshot({ quality: 95 });
-      const photoUri = photo.path.startsWith("file://") ? photo.path : `file://${photo.path}`;
+  const camera = cameraRef.current;
+  if (!cameraReadyRef.current || !camera) {
+    console.warn(`${TAG} ⚠️ capture blocked`);
+    return;
+  }
 
-      const scaleX = photo.width  / SW;
-      const scaleY = photo.height / SH;
+  capturingRef.current = true;
+  setCapturing(true);
+  setStatusMsg("Capturing high-quality image...");
 
-      const cropX = Math.max(0, Math.round(GUIDE_LEFT * scaleX));
-      const cropY = Math.max(0, Math.round(GUIDE_TOP  * scaleY));
-      const cropW = Math.min(Math.round(GUIDE_SIZE * scaleX), photo.width  - cropX);
-      const cropH = Math.min(Math.round(GUIDE_SIZE * scaleY), photo.height - cropY);
+  try {
+    const photo = await camera.takeSnapshot({ quality: 95 });
+    const photoUri = photo.path.startsWith("file://") 
+      ? photo.path 
+      : `file://${photo.path}`;
 
-      const manipulated = await ImageManipulator.manipulateAsync(
-        photoUri,
-        [
-          { crop: { originX: cropX, originY: cropY, width: cropW, height: cropH } },
-          { resize: { width: OUTPUT_SIZE, height: OUTPUT_SIZE } },
-        ],
-        { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG },
-      );
+    const scaleX = photo.width / SW;
+    const scaleY = photo.height / SH;
 
-      console.log(`${TAG} ✅ Captured ${eyeSide} eye: ${manipulated.uri}`);
+    const cropX = Math.max(0, Math.round(GUIDE_LEFT * scaleX));
+    const cropY = Math.max(0, Math.round(GUIDE_TOP * scaleY));
+    const cropW = Math.min(Math.round(GUIDE_SIZE * scaleX), photo.width - cropX);
+    const cropH = Math.min(Math.round(GUIDE_SIZE * scaleY), photo.height - cropY);
 
-      router.replace({
-        pathname: "/",
-        params: {
-          eyeImage:      manipulated.uri,
-          eyeSide:       eyeSide,
-          leftEyeImage:  eyeSide === "left"  ? manipulated.uri : (params.leftEyeImage  ?? ""),
-          rightEyeImage: eyeSide === "right" ? manipulated.uri : (params.rightEyeImage ?? ""),
-          name:          params.name,
-          parentName:    params.parentName,
-          phoneNumber:   params.phoneNumber,
-          age:           params.age,
-          gender:        params.gender,
-          eyeSessionId:  params.eyeSessionId,
-        },
-      });
-    } catch (err: any) {
-      console.error(`${TAG} ❌ CAPTURE FAILED:`, err);
-      setStatusMsg("Capture failed — try again");
-    } finally {
-      setCapturing(false);
-      capturingRef.current = false;
-    }
-  }, [router, eyeSide, params]);
+    const manipulated = await ImageManipulator.manipulateAsync(
+      photoUri,
+      [
+        { crop: { originX: cropX, originY: cropY, width: cropW, height: cropH } },
+        { resize: { width: OUTPUT_SIZE, height: OUTPUT_SIZE } },
+      ],
+      { compress: 0.92, format: ImageManipulator.SaveFormat.JPEG }
+    );
 
+    console.log(`${TAG} ✅ Captured ${eyeSide} eye: ${manipulated.uri}`);
+
+    // === IMPORTANT FIX: Send BOTH eye images ===
+    router.replace({
+      pathname: "/",
+      params: {
+        eyeImage: manipulated.uri,
+        eyeSide: eyeSide,
+
+        // Preserve the other eye image
+        leftEyeImage: eyeSide === "left" 
+          ? manipulated.uri 
+          : (params.leftEyeImage ?? ""),
+
+        rightEyeImage: eyeSide === "right" 
+          ? manipulated.uri 
+          : (params.rightEyeImage ?? ""),
+
+        name: params.name,
+        parentName: params.parentName,
+        phoneNumber: params.phoneNumber,
+        age: params.age,
+        gender: params.gender,
+        eyeSessionId: params.eyeSessionId,
+      },
+    });
+  } catch (err: any) {
+    console.error(`${TAG} ❌ CAPTURE FAILED:`, err);
+    setStatusMsg("Capture failed – try again");
+  } finally {
+    setCapturing(false);
+    capturingRef.current = false;
+  }
+}, [router, eyeSide, params]);
   const triggerCaptureJS = Worklets.createRunOnJS(captureAndNavigate);
 
-  // ── ONNX inference (JS thread) ────────────────────────────────
-  const runOnnxDetection = Worklets.createRunOnJS(
-    async (hwcBuffer: Float32Array) => {
-      const s = sessionRef.current;
-      if (!s || capturingRef.current) return;
-
-      try {
-        // HWC → CHW transpose
-        const chw = new Float32Array(3 * MODEL_SIZE * MODEL_SIZE);
-        const px  = MODEL_SIZE * MODEL_SIZE;
-        for (let i = 0; i < px; i++) {
-          chw[i]          = hwcBuffer[i * 3];
-          chw[i + px]     = hwcBuffer[i * 3 + 1];
-          chw[i + px * 2] = hwcBuffer[i * 3 + 2];
-        }
-
-        const inputTensor = new Tensor("float32", chw, [1, 3, MODEL_SIZE, MODEL_SIZE]);
-
-        // ── Inference timing ──────────────────────────────────
-        const t0 = performance.now();
-        const results = await s.run({ input: inputTensor });
-        const inferenceMs = performance.now() - t0;
-        setInferMsJS(Math.round(inferenceMs));
-        console.log(`${TAG} ⏱ inference: ${inferenceMs.toFixed(1)} ms`);
-        // ──────────────────────────────────────────────────────
-
-        const detTensor = results["detections"];
-
-        if (!detTensor) {
-          console.warn(`${TAG} ⚠️ no "detections" output`);
-          setDetectedJS(false);
-          setScoreJS(0);
-          setDebugEyeBoxJS(null);
-          setStatusMsgJS("No eye detected");
-          consecutiveRef.current = 0;
-          setFrameCountJS(0);
-          return;
-        }
-
-        const raw           = detTensor.data as Float32Array;
-        const numDetections = raw.length / 6;
-
-        let bestScore = 0, bestX1 = 0, bestY1 = 0, bestX2 = 0, bestY2 = 0;
-        for (let i = 0; i < numDetections; i++) {
-          const o = i * 6;
-          if (raw[o + 4] > bestScore) {
-            bestScore = raw[o + 4];
-            bestX1 = raw[o];  bestY1 = raw[o + 1];
-            bestX2 = raw[o + 2]; bestY2 = raw[o + 3];
-          }
-        }
-
-        console.log(
-          `${TAG} detection score=${bestScore.toFixed(3)} box=[${bestX1.toFixed(1)},${bestY1.toFixed(1)},${bestX2.toFixed(1)},${bestY2.toFixed(1)}]`,
-        );
-
-        setScoreJS(bestScore);
-
-        if (bestScore < CONF_THRESHOLD) {
-          setDetectedJS(false);
-          setDebugEyeBoxJS(null);
-          setStatusMsgJS("Position eye in the box");
-          consecutiveRef.current = 0;
-          setFrameCountJS(0);
-          return;
-        }
-
-        const box          = getEyeBoxOnScreen(bestX1, bestY1, bestX2, bestY2);
-        const insideGuide  = checkEyeWithinGuideBox(bestX1, bestY1, bestX2, bestY2);
-
-        setDebugEyeBoxJS({
-          left: box.left, top: box.top,
-          width: box.width, height: box.height,
-          score: bestScore, insideGuide,
-        });
-
-        if (insideGuide) {
-          consecutiveRef.current += 1;
-          setDetectedJS(true);
-          setFrameCountJS(consecutiveRef.current);
-
-          if (consecutiveRef.current >= FRAMES_NEEDED) {
-            console.log(`${TAG} 🎯 triggering capture (${FRAMES_NEEDED} frames held)`);
-            consecutiveRef.current = 0;
-            triggerCaptureJS();
-          } else {
-            setStatusMsgJS(`Hold still… ${consecutiveRef.current}/${FRAMES_NEEDED}`);
-          }
-        } else {
-          consecutiveRef.current = 0;
-          setDetectedJS(false);
-          setFrameCountJS(0);
-          setStatusMsgJS("Move eye into the box");
-        }
-      } catch (err: any) {
-        console.error(`${TAG} ❌ ONNX inference failed:`, err?.message ?? String(err));
-      }
-    },
-  );
-
-  // ── Frame processor ───────────────────────────────────────────
   const frameProcessor = useFrameProcessor(
     (frame) => {
       "worklet";
@@ -394,58 +544,186 @@ export default function EyeCaptureScreen() {
       frameLogCounterRef.current += 1;
       const shouldLog = frameLogCounterRef.current % LOG_EVERY_N_FRAMES === 0;
 
-      if (!sessionRef.current) {
-        if (shouldLog) console.log(`${TAG} ⏳ session not ready — frame ${frameLogCounterRef.current}`);
+      if (!model) {
+        if (shouldLog) console.log(`${TAG} ⏳ model not ready yet`);
         return;
       }
       if (capturingRef.current) return;
 
-      const rotation = getResizeRotation(frame.orientation);
+      const resizeRotation = getResizeRotation(frame.orientation);
 
       if (shouldLog) {
         console.log(
-          `${TAG} frame w=${frame.width} h=${frame.height} orientation=${frame.orientation} rotation=${rotation}`,
+          `${TAG} frame w=${frame.width} h=${frame.height} orientation=${frame.orientation} mirrored=${frame.isMirrored} pixelFormat=${frame.pixelFormat} rotation=${resizeRotation}`,
         );
       }
 
-      let resized: Float32Array;
       try {
-        resized = resize(frame, {
-          scale: { width: MODEL_SIZE, height: MODEL_SIZE },
-          pixelFormat: "rgb",
-          dataType: "float32",
-          rotation,
-        }) as Float32Array;
-      } catch (err: any) {
-        console.error(`${TAG} ❌ resize failed:`, err?.message ?? String(err));
-        return;
-      }
+        let resized: Float32Array;
+        try {
+          resized = resize(frame, {
+            scale: { width: MODEL_SIZE, height: MODEL_SIZE },
+            pixelFormat: "rgb",
+            dataType: "float32",
+            rotation: resizeRotation,
+          }) as Float32Array;
+        } catch (resizeErr: any) {
+          console.error(
+            `${TAG} ❌ RESIZE FAILED:`,
+            resizeErr?.message ?? String(resizeErr),
+          );
+          return;
+        }
 
-      runOnnxDetection(resized);
+        if (shouldLog) {
+          console.log(
+            `${TAG} resized len=${resized?.length} sample=[${resized?.[0]?.toFixed?.(3)},${resized?.[1]?.toFixed?.(3)},${resized?.[2]?.toFixed?.(3)}]`,
+          );
+        }
+
+        try {
+          const q = computeFrameQuality(resized, MODEL_SIZE, MODEL_SIZE);
+          setQualityJS(q);
+          if (shouldLog) {
+            console.log(
+              `${TAG} quality blur=${q.blurScore.toFixed(1)}(${q.blurStatus}) bright=${q.brightness.toFixed(1)}(${q.lightStatus}) cct=${q.cct.toFixed(0)}(${q.tempStatus})`,
+            );
+          }
+        } catch (qErr: any) {
+          console.error(
+            `${TAG} ❌ QUALITY CALC FAILED:`,
+            qErr?.message ?? String(qErr),
+          );
+        }
+
+        let outputs: any;
+        try {
+          outputs = model.runSync([resized]);
+        } catch (modelErr: any) {
+          console.error(
+            `${TAG} ❌ MODEL RUNSYNC FAILED:`,
+            modelErr?.message ?? String(modelErr),
+          );
+          return;
+        }
+
+        if (!outputs?.length) {
+          if (shouldLog) console.warn(`${TAG} ⚠️ model returned no outputs`);
+          return;
+        }
+
+        const raw = outputs[0] as Float32Array;
+        let bestScore = 0;
+        let bestX1 = 0;
+        let bestY1 = 0;
+        let bestX2 = 0;
+        let bestY2 = 0;
+
+        for (let i = 0; i < NUM_DETECTIONS; i++) {
+          const offset = i * VALS_PER_BOX;
+          const conf = raw[offset + 4];
+
+          if (conf > bestScore) {
+            bestScore = conf;
+            bestX1 = raw[offset];
+            bestY1 = raw[offset + 1];
+            bestX2 = raw[offset + 2];
+            bestY2 = raw[offset + 3];
+          }
+        }
+
+        setScoreJS(bestScore);
+
+        const eyeInsideGuide =
+          bestScore >= CONF_THRESHOLD &&
+          checkEyeWithinGuideBox(bestX1, bestY1, bestX2, bestY2);
+
+        if (shouldLog) {
+          console.log(
+            `${TAG} bestScore=${bestScore.toFixed(3)} box=[${bestX1.toFixed(1)},${bestY1.toFixed(1)},${bestX2.toFixed(1)},${bestY2.toFixed(1)}] insideGuide=${eyeInsideGuide}`,
+          );
+        }
+
+        if (bestScore >= CONF_THRESHOLD) {
+          const box = getEyeBoxOnScreen(bestX1, bestY1, bestX2, bestY2);
+          setDebugEyeBoxJS({
+            left: box.left,
+            top: box.top,
+            width: box.width,
+            height: box.height,
+            score: bestScore,
+            insideGuide: eyeInsideGuide,
+          });
+        } else {
+          setDebugEyeBoxJS(null);
+        }
+
+        if (eyeInsideGuide) {
+          consecutiveRef.current += 1;
+          setDetectedJS(true);
+          setFrameCountJS(consecutiveRef.current);
+
+          if (consecutiveRef.current >= FRAMES_NEEDED) {
+            console.log(
+              `${TAG} 🎯 triggering capture (held ${FRAMES_NEEDED} frames)`,
+            );
+            consecutiveRef.current = 0;
+            triggerCaptureJS();
+          } else {
+            setStatusMsgJS(
+              `Hold still... ${consecutiveRef.current}/${FRAMES_NEEDED}`,
+            );
+          }
+        } else {
+          consecutiveRef.current = 0;
+          setDetectedJS(false);
+          setFrameCountJS(0);
+          setStatusMsgJS(
+            bestScore >= CONF_THRESHOLD
+              ? "Keep full eye inside the box"
+              : "Position eye in the box",
+          );
+        }
+      } catch (err: any) {
+        console.error(
+          `${TAG} ❌ FRAME PROCESSOR CRASHED:`,
+          err?.message ?? String(err),
+        );
+      }
     },
-    [sessionRef],
+    [model],
   );
 
-  // ── Voice guidance ────────────────────────────────────────────
+  const qualityGood =
+    quality.blurStatus === "good" &&
+    quality.lightStatus === "good" &&
+    quality.tempStatus === "good";
+  const allGood = detected && qualityGood;
+  const problemKey = getProblemKey(
+    detected,
+    quality.lightStatus,
+    quality.blurStatus,
+    quality.tempStatus,
+  );
+  const instrText = VOICE[problemKey]?.[lang]?.text ?? "";
+
   const speakNow = useCallback(
     (key: string, l: Lang = lang) => {
       const entry = VOICE[key]?.[l];
       if (!entry) return;
+
       Speech.stop();
       setIsSpeaking(true);
       Speech.speak(entry.text, {
         language: entry.bcp47,
         rate: 1.0,
         pitch: 1.0,
-        onDone:  () => setIsSpeaking(false),
+        onDone: () => setIsSpeaking(false),
         onError: () => setIsSpeaking(false),
       });
     },
     [lang],
   );
-
-  const problemKey = detected ? "allGood" : "alignFace";
-  const instrText  = VOICE[problemKey]?.[lang]?.text ?? "";
 
   useEffect(() => {
     const now = Date.now();
@@ -453,25 +731,40 @@ export default function EyeCaptureScreen() {
       problemKey !== lastSpokenKey.current ||
       now - lastSpokenTime.current > 8000
     ) {
-      lastSpokenKey.current  = problemKey;
+      lastSpokenKey.current = problemKey;
       lastSpokenTime.current = now;
       speakNow(problemKey, lang);
     }
   }, [problemKey, lang, speakNow]);
 
-  // ── Guards ────────────────────────────────────────────────────
+  const handleLangChange = useCallback((l: Lang) => setLang(l), []);
+
   if (!hasPermission) {
     return (
       <View style={s.center}>
-        <Text style={s.permText} onPress={async () => { await requestPermission(); }}>
+        <Text
+          style={s.permText}
+          onPress={async () => {
+            console.log(`${TAG} requesting camera permission...`);
+            const granted = await requestPermission();
+            console.log(`${TAG} permission request result=${granted}`);
+          }}
+        >
           Tap to grant camera permission
         </Text>
       </View>
     );
   }
+
   if (!device) {
-    return <View style={s.center}><Text style={s.label}>No front camera found</Text></View>;
+    console.warn(`${TAG} ⚠️ no front camera device found`);
+    return (
+      <View style={s.center}>
+        <Text style={s.label}>No front camera found</Text>
+      </View>
+    );
   }
+
   if (modelState === "loading") {
     return (
       <View style={s.center}>
@@ -480,26 +773,34 @@ export default function EyeCaptureScreen() {
       </View>
     );
   }
+
   if (modelState === "error") {
     return (
       <View style={s.center}>
-        <Text style={[s.permText, { color: "#ff5555" }]}>❌ Model failed to load</Text>
+        <Text style={[s.permText, { color: "#ff5555" }]}>
+          ❌ Model failed to load
+        </Text>
       </View>
     );
   }
 
-  // ── Derived UI ────────────────────────────────────────────────
-  const progressPct = Math.min(100, Math.round((frameCount / FRAMES_NEEDED) * 100));
-  const guideColor  = capturing ? "#ffeb3b" : detected ? "#00ff66" : "#4c9fff";
+  const progressPct = Math.round((frameCount / FRAMES_NEEDED) * 100);
+  const guideColor = capturing
+    ? "#ffeb3b"
+    : allGood
+      ? "#00ff66"
+      : detected
+        ? "#FFD700"
+        : "#4c9fff";
 
-  let captureBtnLabel = "Align eye…";
-  if (capturing)  captureBtnLabel = "Capturing…";
-  else if (detected) captureBtnLabel = `📸 Auto-capturing… ${frameCount}/${FRAMES_NEEDED}`;
+  let captureBtnLabel = "Waiting…";
+  if (capturing) captureBtnLabel = "Capturing…";
+  else if (allGood) captureBtnLabel = "📸 Auto-capturing…";
+  else if (detected && !qualityGood) captureBtnLabel = "Eye ✅ — Fix quality";
+  else if (!detected) captureBtnLabel = "Align eye…";
 
   return (
     <View style={s.root}>
-
-      {/* Camera */}
       <Camera
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
@@ -512,50 +813,99 @@ export default function EyeCaptureScreen() {
         }}
         onError={(error) => {
           cameraReadyRef.current = false;
-          console.error(`${TAG} ❌ camera error:`, error?.message ?? String(error));
-          setStatusMsg("Camera error — try again");
+          console.error(
+            `${TAG} ❌ camera onError:`,
+            error?.message ?? String(error),
+            (error as any)?.code ?? "",
+          );
+          setStatusMsg("Camera error - try again");
         }}
         photo
       />
 
-      {/* Vignette */}
       <View style={[s.vig, { top: 0, left: 0, right: 0, height: GUIDE_TOP }]} />
-      <View style={[s.vig, { top: GUIDE_TOP + GUIDE_SIZE, left: 0, right: 0, bottom: 0 }]} />
-      <View style={[s.vig, { top: GUIDE_TOP, left: 0, width: GUIDE_LEFT, height: GUIDE_SIZE }]} />
-      <View style={[s.vig, { top: GUIDE_TOP, left: GUIDE_LEFT + GUIDE_SIZE, right: 0, height: GUIDE_SIZE }]} />
+      <View
+        style={[
+          s.vig,
+          { top: GUIDE_TOP + GUIDE_SIZE, left: 0, right: 0, bottom: 0 },
+        ]}
+      />
+      <View
+        style={[
+          s.vig,
+          { top: GUIDE_TOP, left: 0, width: GUIDE_LEFT, height: GUIDE_SIZE },
+        ]}
+      />
+      <View
+        style={[
+          s.vig,
+          {
+            top: GUIDE_TOP,
+            left: GUIDE_LEFT + GUIDE_SIZE,
+            right: 0,
+            height: GUIDE_SIZE,
+          },
+        ]}
+      />
 
-      {/* Guide box */}
-      <View style={[s.guide, { borderColor: guideColor, borderStyle: detected ? "solid" : "dashed" }]}>
+      <View
+        style={[
+          s.guide,
+          {
+            borderColor: guideColor,
+            borderStyle: capturing || detected ? "solid" : "dashed",
+          },
+        ]}
+      >
         {(["TL", "TR", "BL", "BR"] as const).map((c) => (
-          <View key={c} style={[s.corner, (s as any)[`corner${c}`], { borderColor: guideColor }]} />
+          <View
+            key={c}
+            style={[s.corner, (s as any)[`corner${c}`], { borderColor: guideColor }]}
+          />
         ))}
         <View style={s.verticalLine} />
         <View style={s.horizontalLine} />
         <View style={[s.centerDot, { borderColor: guideColor }]} />
       </View>
 
-      {/* Debug eye box overlay */}
-      {debugEyeBox && (
+      {debugEyeBox && debugging && (
         <View
           pointerEvents="none"
           style={[
             s.debugEyeBox,
-            debugEyeBox.insideGuide ? s.debugEyeBoxInside : s.debugEyeBoxOutside,
-            { left: debugEyeBox.left, top: debugEyeBox.top, width: debugEyeBox.width, height: debugEyeBox.height },
+            debugEyeBox.insideGuide
+              ? s.debugEyeBoxInside
+              : s.debugEyeBoxOutside,
+            {
+              left: debugEyeBox.left,
+              top: debugEyeBox.top,
+              width: debugEyeBox.width,
+              height: debugEyeBox.height,
+            },
           ]}
         >
-          <Text style={[s.debugEyeBoxLabel, debugEyeBox.insideGuide ? s.debugLabelInside : s.debugLabelOutside]}>
-            {debugEyeBox.insideGuide ? "IN" : "OUT"} {(debugEyeBox.score * 100).toFixed(0)}%
+          <Text
+            style={[
+              s.debugEyeBoxLabel,
+              debugEyeBox.insideGuide
+                ? s.debugEyeBoxLabelInside
+                : s.debugEyeBoxLabelOutside,
+            ]}
+          >
+            {debugEyeBox.insideGuide ? "IN" : "OUT"} {debugEyeBox.score.toFixed(2)}
           </Text>
         </View>
       )}
 
-      {/* Progress bar */}
       <View style={s.progressTrack}>
-        <View style={[s.progressFill, { width: `${progressPct}%`, backgroundColor: guideColor }]} />
+        <View
+          style={[
+            s.progressFill,
+            { width: `${progressPct}%`, backgroundColor: guideColor },
+          ]}
+        />
       </View>
 
-      {/* Top panel */}
       <View style={s.topPanel}>
         <View style={s.controlRow}>
           <TouchableOpacity style={s.backBtn} onPress={() => router.back()}>
@@ -576,7 +926,7 @@ export default function EyeCaptureScreen() {
                   idx === 2 && s.radioBtnLast,
                   lang === l && s.radioBtnActive,
                 ]}
-                onPress={() => setLang(l)}
+                onPress={() => handleLangChange(l)}
               >
                 <Text style={[s.radioLabel, lang === l && s.radioLabelActive]}>
                   {l === "en" ? "EN" : l === "hi" ? "हि" : "తె"}
@@ -586,161 +936,344 @@ export default function EyeCaptureScreen() {
           </View>
         </View>
 
-        {/* Status pill */}
-        <View style={[s.statusPill, { borderColor: guideColor }]}>
-          <IconEye size={16} color={guideColor} />
-          <Text style={[s.statusText, { color: guideColor }]}>{statusMsg}</Text>
+        <View style={s.indicatorRow}>
+          {[
+            {
+              icon: <IconEye size={18} color="#fff" />,
+              label: "EYE",
+              ok: detected,
+            },
+            {
+              icon: <IconLight size={18} color="#fff" />,
+              label: "LIGHT",
+              ok: quality.lightStatus === "good",
+            },
+            {
+              icon: <IconBlur size={18} color="#fff" />,
+              label: "SHARP",
+              ok: quality.blurStatus === "good",
+            },
+            {
+              icon: <IconLight size={18} color="#fff" />,
+              label: "COLOR",
+              ok: quality.tempStatus === "good",
+            },
+          ].map(({ icon, label, ok }) => (
+            <View key={label} style={s.indicator}>
+              <View style={s.indicatorHeader}>
+                {icon}
+                <Text style={s.indicatorLabel}>{label}</Text>
+              </View>
+              <View
+                style={[
+                  s.indicatorBlock,
+                  { backgroundColor: ok ? "#a8e6a3" : "#f4a97f" },
+                ]}
+              />
+            </View>
+          ))}
         </View>
 
-        {/* Voice instruction */}
-        <View style={[s.instrBox, { borderColor: detected ? "#00e676" : "rgba(255,255,255,0.15)" }]}>
+        <View
+          style={[
+            s.instrBox,
+            {
+              borderColor: allGood
+                ? "#00e676"
+                : detected
+                  ? "#FFD700"
+                  : "rgba(255,255,255,0.15)",
+            },
+          ]}
+        >
           {isSpeaking && (
             <View style={s.speakingDot}>
-              <View style={[s.speakingPulse, { backgroundColor: detected ? "#00e676" : "#f4a97f" }]} />
+              <View
+                style={[
+                  s.speakingPulse,
+                  { backgroundColor: allGood ? "#00e676" : "#f4a97f" },
+                ]}
+              />
             </View>
           )}
-          <Text style={[s.instrText, { color: detected ? "#00e676" : "#fff" }]}>{instrText}</Text>
+          <Text
+            style={[
+              s.instrText,
+              { color: allGood ? "#00e676" : detected ? "#FFD700" : "#fff" },
+            ]}
+          >
+            {instrText}
+          </Text>
           <TouchableOpacity style={s.speakBtn} onPress={() => speakNow(problemKey)}>
-            <IconSpeaker size={20} color={detected ? "#00e676" : "#fff"} />
+            <IconSpeaker size={20} color={allGood ? "#00e676" : "#fff"} />
           </TouchableOpacity>
         </View>
 
         <View style={s.hintBox}>
-          <Text style={s.hintText}>📱 Hold 10–15 cm • Pull lower eyelid down • Fill the guide box</Text>
+          <Text style={s.hintText}>
+            📱 Hold 10–15 cm • Pull lower eyelid • Keep full eye inside box
+          </Text>
         </View>
       </View>
 
-      {/* Bottom debug + capture */}
       <View style={s.captureArea}>
+        <Text style={s.debugText}>{statusMsg}</Text>
         <Text style={s.debugText}>
-          score: {score.toFixed(2)}  |  frames: {frameCount}/{FRAMES_NEEDED}  |  infer: {inferMs} ms
+          Blur:{quality.blurScore.toFixed(0)} | Bright:
+          {quality.brightness.toFixed(0)} | {quality.cct.toFixed(0)}K | score:
+          {score.toFixed(2)}
         </Text>
         <Text style={s.debugText}>
-          model: {modelState}  |  side: {eyeSide}
+          Frames:{frameCount}/{FRAMES_NEEDED} | model:{modelState} | side:
+          {eyeSide}
         </Text>
 
         <TouchableOpacity
           style={[
             s.captureBtn,
-            { backgroundColor: detected ? "#00c853" : "#2a2a2a", borderColor: detected ? "#00ff66" : "#444" },
+            {
+              backgroundColor: allGood
+                ? "#00c853"
+                : detected
+                  ? "#7c4dff"
+                  : "#2a2a2a",
+              borderColor: allGood
+                ? "#00ff66"
+                : detected
+                  ? "#b39ddb"
+                  : "#444",
+            },
             capturing && { opacity: 0.6 },
           ]}
           onPress={captureAndNavigate}
           disabled={capturing}
           activeOpacity={0.75}
         >
-          {capturing
-            ? <ActivityIndicator color="#fff" />
-            : <Text style={[s.captureBtnText, { opacity: detected ? 1 : 0.4 }]}>{captureBtnLabel}</Text>
-          }
+          {capturing ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <Text style={[s.captureBtnText, { opacity: detected ? 1 : 0.4 }]}>
+              {captureBtnLabel}
+            </Text>
+          )}
         </TouchableOpacity>
       </View>
     </View>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  STYLES
-// ─────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  root:    { flex: 1, backgroundColor: "#000" },
-  center:  { flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "#000", padding: 24 },
-  permText:{ fontSize: 16, color: "#fff", textAlign: "center" },
-  label:   { fontSize: 16, color: "#fff" },
+  root: { flex: 1, backgroundColor: "#000" },
+  center: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#000",
+    padding: 24,
+  },
+  permText: {
+    fontSize: 16,
+    color: "#fff",
+    textAlign: "center",
+    marginBottom: 4,
+  },
+  label: { fontSize: 16, color: "#fff" },
 
   vig: { position: "absolute", backgroundColor: "rgba(0,0,0,0.58)" },
 
   guide: {
     position: "absolute",
-    left: GUIDE_LEFT, top: GUIDE_TOP,
-    width: GUIDE_SIZE, height: GUIDE_SIZE,
-    borderWidth: 2.5, borderRadius: 6,
-    justifyContent: "center", alignItems: "center",
+    left: GUIDE_LEFT,
+    top: GUIDE_TOP,
+    width: GUIDE_SIZE,
+    height: GUIDE_SIZE,
+    borderWidth: 2.5,
+    borderRadius: 6,
+    justifyContent: "center",
+    alignItems: "center",
   },
   corner: { position: "absolute", width: 22, height: 22, borderWidth: 3 },
-  cornerTL: { top: -2, left: -2,   borderBottomWidth: 0, borderRightWidth: 0,  borderTopLeftRadius: 8 },
-  cornerTR: { top: -2, right: -2,  borderBottomWidth: 0, borderLeftWidth: 0,   borderTopRightRadius: 8 },
-  cornerBL: { bottom: -2, left: -2,  borderTopWidth: 0, borderRightWidth: 0,   borderBottomLeftRadius: 8 },
-  cornerBR: { bottom: -2, right: -2, borderTopWidth: 0, borderLeftWidth: 0,    borderBottomRightRadius: 8 },
-  verticalLine:   { position: "absolute", width: 1,  height: "80%", backgroundColor: "rgba(255,255,255,0.2)" },
-  horizontalLine: { position: "absolute", height: 1, width:  "80%", backgroundColor: "rgba(255,255,255,0.2)" },
+  cornerTL: { top: -2, left: -2, borderBottomWidth: 0, borderRightWidth: 0, borderTopLeftRadius: 8 },
+  cornerTR: { top: -2, right: -2, borderBottomWidth: 0, borderLeftWidth: 0, borderTopRightRadius: 8 },
+  cornerBL: { bottom: -2, left: -2, borderTopWidth: 0, borderRightWidth: 0, borderBottomLeftRadius: 8 },
+  cornerBR: { bottom: -2, right: -2, borderTopWidth: 0, borderLeftWidth: 0, borderBottomRightRadius: 8 },
+  verticalLine: {
+    position: "absolute",
+    width: 1,
+    height: "80%",
+    backgroundColor: "rgba(255,255,255,0.2)",
+  },
+  horizontalLine: {
+    position: "absolute",
+    height: 1,
+    width: "80%",
+    backgroundColor: "rgba(255,255,255,0.2)",
+  },
   centerDot: { width: 12, height: 12, borderRadius: 6, borderWidth: 2 },
 
-  debugEyeBox: { position: "absolute", borderWidth: 2, borderRadius: 4, zIndex: 5 },
-  debugEyeBoxInside:  { borderColor: "#00e676" },
+  debugEyeBox: {
+    position: "absolute",
+    borderWidth: 2,
+    borderRadius: 4,
+    zIndex: 5,
+  },
+  debugEyeBoxInside: { borderColor: "#00e676" },
   debugEyeBoxOutside: { borderColor: "#ff5252" },
   debugEyeBoxLabel: {
-    position: "absolute", top: -22, left: -2,
-    paddingHorizontal: 6, paddingVertical: 2,
-    borderRadius: 4, fontSize: 10, fontWeight: "900", overflow: "hidden",
+    position: "absolute",
+    top: -22,
+    left: -2,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    color: "#000",
+    fontSize: 10,
+    fontWeight: "900",
+    overflow: "hidden",
   },
-  debugLabelInside:  { backgroundColor: "#00e676", color: "#000" },
-  debugLabelOutside: { backgroundColor: "#ff5252", color: "#fff" },
+  debugEyeBoxLabelInside: { backgroundColor: "#00e676" },
+  debugEyeBoxLabelOutside: { backgroundColor: "#ff5252", color: "#fff" },
 
   progressTrack: {
     position: "absolute",
     top: GUIDE_TOP + GUIDE_SIZE + 10,
-    left: GUIDE_LEFT, width: GUIDE_SIZE, height: 4,
-    backgroundColor: "rgba(255,255,255,0.18)", borderRadius: 2, overflow: "hidden",
+    left: GUIDE_LEFT,
+    width: GUIDE_SIZE,
+    height: 4,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    borderRadius: 2,
+    overflow: "hidden",
   },
   progressFill: { height: 4, borderRadius: 2 },
 
   topPanel: {
-    position: "absolute", top: 0, left: 0, right: 0,
-    paddingTop: 46, paddingHorizontal: 12, paddingBottom: 8,
-    backgroundColor: "rgba(0,0,0,0.80)", gap: 6, zIndex: 10,
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    paddingTop: 46,
+    paddingHorizontal: 12,
+    paddingBottom: 8,
+    backgroundColor: "rgba(0,0,0,0.80)",
+    gap: 6,
+    zIndex: 10,
   },
-  controlRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  controlRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
   backBtn: {
-    paddingVertical: 6, paddingHorizontal: 12, borderRadius: 10,
-    backgroundColor: "rgba(255,255,255,0.1)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.1)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
   },
   backBtnText: { color: "#fff", fontSize: 12, fontWeight: "600" },
-  sideLabel: { backgroundColor: "rgba(91,45,142,0.8)", paddingVertical: 4, paddingHorizontal: 12, borderRadius: 20 },
-  sideLabelText: { color: "#fff", fontWeight: "700", fontSize: 12, letterSpacing: 1 },
 
-  radioGroup: { flexDirection: "row", borderRadius: 10, overflow: "hidden", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
-  radioBtn: { paddingVertical: 6, paddingHorizontal: 10, backgroundColor: "rgba(255,255,255,0.07)", borderRightWidth: 1, borderRightColor: "rgba(255,255,255,0.15)" },
+  sideLabel: {
+    backgroundColor: "rgba(91,45,142,0.8)",
+    paddingVertical: 4,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+  },
+  sideLabelText: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 12,
+    letterSpacing: 1,
+  },
+
+  radioGroup: {
+    flexDirection: "row",
+    borderRadius: 10,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
+  },
+  radioBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    backgroundColor: "rgba(255,255,255,0.07)",
+    borderRightWidth: 1,
+    borderRightColor: "rgba(255,255,255,0.15)",
+  },
   radioBtnFirst: { borderTopLeftRadius: 10, borderBottomLeftRadius: 10 },
-  radioBtnLast:  { borderTopRightRadius: 10, borderBottomRightRadius: 10, borderRightWidth: 0 },
+  radioBtnLast: {
+    borderTopRightRadius: 10,
+    borderBottomRightRadius: 10,
+    borderRightWidth: 0,
+  },
   radioBtnActive: { backgroundColor: "rgba(255,215,0,0.18)" },
   radioLabel: { color: "rgba(255,255,255,0.6)", fontSize: 11, fontWeight: "700" },
   radioLabelActive: { color: "#FFD700" },
 
-  statusPill: {
-    flexDirection: "row", alignItems: "center", gap: 8,
-    borderWidth: 1, borderRadius: 12,
-    paddingVertical: 8, paddingHorizontal: 12,
-    backgroundColor: "rgba(255,255,255,0.06)",
+  indicatorRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: 8,
   },
-  statusText: { fontSize: 13, fontWeight: "700", flex: 1 },
+  indicator: { flex: 1, alignItems: "flex-start", gap: 4 },
+  indicatorHeader: { flexDirection: "row", alignItems: "center", gap: 5 },
+  indicatorLabel: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "800",
+    letterSpacing: 0.5,
+  },
+  indicatorBlock: { width: "100%", height: 16, borderRadius: 8 },
 
   instrBox: {
-    borderWidth: 1, borderRadius: 12,
-    paddingVertical: 9, paddingHorizontal: 12,
-    flexDirection: "row", alignItems: "center",
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
     backgroundColor: "rgba(255,255,255,0.06)",
   },
-  speakingDot:  { marginRight: 8, justifyContent: "center", alignItems: "center" },
-  speakingPulse:{ width: 9, height: 9, borderRadius: 5, opacity: 0.9 },
-  instrText:    { flex: 1, fontSize: 12.5, fontWeight: "700" },
-  speakBtn:     { paddingLeft: 8 },
+  speakingDot: { marginRight: 8, justifyContent: "center", alignItems: "center" },
+  speakingPulse: { width: 9, height: 9, borderRadius: 5, opacity: 0.9 },
+  instrText: { flex: 1, fontSize: 12.5, fontWeight: "700" },
+  speakBtn: { paddingLeft: 8 },
 
-  hintBox: { backgroundColor: "rgba(255,255,255,0.06)", borderRadius: 10, paddingVertical: 5, paddingHorizontal: 10 },
+  hintBox: {
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderRadius: 10,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+  },
   hintText: { color: "rgba(255,255,255,0.55)", fontSize: 10, textAlign: "center" },
 
   captureArea: {
-    position: "absolute", left: 0, right: 0, bottom: 0,
-    paddingVertical: 14, paddingHorizontal: 16,
-    alignItems: "center", gap: 6,
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    alignItems: "center",
+    gap: 6,
     backgroundColor: "rgba(0,0,0,0.65)",
   },
-  debugText: { color: "rgba(255,255,255,0.55)", fontSize: 11, fontFamily: "monospace", textAlign: "center" },
+  debugText: {
+    color: "rgba(255,255,255,0.55)",
+    fontSize: 11,
+    fontFamily: "monospace",
+    textAlign: "center",
+  },
   captureBtn: {
-    marginTop: 4, paddingVertical: 16, paddingHorizontal: 48,
-    borderRadius: 80, borderWidth: 2,
-    alignItems: "center", justifyContent: "center",
-    minWidth: 200, minHeight: 56,
+    marginTop: 4,
+    paddingVertical: 16,
+    paddingHorizontal: 48,
+    borderRadius: 80,
+    borderWidth: 2,
+    alignItems: "center",
+    justifyContent: "center",
+    minWidth: 200,
+    minHeight: 56,
   },
   captureBtnText: { color: "#fff", fontSize: 18, fontWeight: "bold" },
 });
